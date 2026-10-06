@@ -1,21 +1,128 @@
-.vc-extraHomeTab-page {
+.vc-nighty-tab-page {
     position: relative;
     width: 100%;
     height: 100%;
     background-color: var(--background-primary);
 }
 
-.vc-extraHomeTab-frame {
+.vc-nighty-tab-frame {
     position: absolute;
     inset: 0;
     width: 100%;
     height: 100%;
     border: 0;
     background-color: var(--background-primary);
+    opacity: 1;
+    transition: opacity 0.2s ease-in-out;
 }
 
-.vc-extraHomeTab-icon {
+.vc-nighty-tab-frame-hidden {
+    opacity: 0;
+    pointer-events: none;
+}
+
+.vc-nighty-tab-loader {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 14px;
+    background-color: var(--background-primary);
+    z-index: 2;
+}
+
+.vc-nighty-tab-spinner {
+    width: 32px;
+    height: 32px;
+    border: 3px solid var(--background-modifier-accent, rgba(255, 255, 255, 0.1));
+    border-top-color: var(--brand-500, #5865f2);
+    border-radius: 50%;
+    animation: vc-nighty-spin 0.8s linear infinite;
+}
+
+@keyframes vc-nighty-spin {
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+.vc-nighty-tab-loader-text {
+    font-size: 14px;
+    font-weight: 500;
+    color: var(--text-muted);
+    letter-spacing: 0.2px;
+    user-select: none;
+}
+
+.vc-nighty-tab-icon {
     width: 20px;
     height: 20px;
     object-fit: contain;
+    border-radius: 4px;
 }
+
+.vc-nighty-tab-empty {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    height: 100%;
+    color: var(--text-muted);
+    text-align: center;
+    gap: 8px;
+    padding: 16px;
+}
+
+/* Server list button & indicator pill */
+.vc-nighty-tab-guild-item-container {
+    position: relative;
+    width: 100%;
+    display: flex;
+    justify-content: center;
+}
+
+.vc-nighty-tab-guild-item-pill {
+    position: absolute;
+    top: 0;
+    left: 0;
+    height: 100%;
+    pointer-events: none;
+}
+
+.vc-nighty-tab-guild-item-pill > [class*="item"] {
+    will-change: transform;
+    max-height: 8px;
+    min-height: 8px;
+    transition: max-height 0.2s ease-in-out;
+}
+
+.vc-nighty-tab-guild-item-pill.hovered > [class*="item"] {
+    max-height: 20px;
+}
+
+.vc-nighty-tab-guild-item-pill.selected > [class*="item"] {
+    max-height: 40px;
+}
+
+.vc-nighty-tab-guild-button-container {
+    position: relative;
+}
+
+.vc-nighty-tab-guild-icon-container {
+    pointer-events: none;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    height: 100%;
+}
+
+.vc-nighty-tab-guild-icon {
+    width: 24px;
+    height: 24px;
+    object-fit: contain;
+    border-radius: 4px;
+}
+

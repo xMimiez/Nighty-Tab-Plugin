@@ -1,23 +1,23 @@
 /*
  * Vencord, a Discord client mod
  * Copyright (c) 2026 Vendicated and contributors
- * SPDX-License-Identifier: GPL-3.0-or-later
+ * SPDX-License-Identifier: MIT
  */
 
 import "./style.css";
 
-import { NavContextMenuPatchCallback } from "@api/ContextMenu";
+import { findGroupChildrenByChildId, NavContextMenuPatchCallback } from "@api/ContextMenu";
+import { addServerListElement, removeServerListElement, ServerListRenderPosition } from "@api/ServerList";
 import { definePluginSettings, migratePluginSettings } from "@api/Settings";
 import ErrorBoundary from "@components/ErrorBoundary";
-import { EquicordDevs } from "@utils/constants";
 import { classNameFactory } from "@utils/css";
 import { sendMessage } from "@utils/discord";
 import { classes } from "@utils/misc";
 import definePlugin, { OptionType, PluginNative } from "@utils/types";
 import { Message } from "@vencord/discord-types";
 import { findByCodeLazy, findComponentByCodeLazy } from "@webpack";
-import { ChannelStore, Menu, MessageActions, useEffect, useRef } from "@webpack/common";
-import type { ReactElement } from "react";
+import { ChannelStore, Menu, MessageActions, NavigationRouter, SelectedChannelStore, useEffect, useState, useStateFromStores } from "@webpack/common";
+import type { MouseEvent, ReactElement } from "react";
 
 const Native = IS_DISCORD_DESKTOP
     ? VencordNative.pluginHelpers["Nighty Tab"] as PluginNative<typeof import("./native")>
@@ -25,7 +25,9 @@ const Native = IS_DISCORD_DESKTOP
 
 const NIGHTY_ROUTE = "/nighty";
 const NIGHTY_ITEM_ID = "nighty";
-const cl = classNameFactory("vc-extraHomeTab-");
+const cl = classNameFactory("vc-nighty-tab-");
+const SETTINGS_KEYS = ["url"] as const;
+const ICON_SETTINGS_KEYS = ["iconType", "customIconUrl"] as const;
 
 const settings = definePluginSettings({
     url: {
@@ -43,6 +45,46 @@ const settings = definePluginSettings({
             return "Use an http or https URL";
         }
     },
+    tabPlacement: {
+        type: OptionType.SELECT,
+        description: "Choose where the Nighty tab appears.",
+        displayName: "Tab Placement",
+        options: [
+            { label: "Home Sidebar (Under Quests)", value: "sidebar", default: true },
+            { label: "Server List (Guild Bar)", value: "guilds" },
+            { label: "Both Sidebar and Server List", value: "both" }
+        ]
+    },
+    iconType: {
+        type: OptionType.SELECT,
+        description: "Select the sidebar and menu icon style.",
+        displayName: "Tab Icon Style",
+        options: [
+            { label: "Neon Blue (Default)", value: "blue", default: true },
+            { label: "Grayscale (Original)", value: "grayscale" },
+            { label: "Custom Image URL", value: "custom" }
+        ]
+    },
+    customIconUrl: {
+        type: OptionType.STRING,
+        description: "Direct image link (PNG, JPG, SVG, WebP) for the tab icon.",
+        displayName: "Custom Icon URL",
+        placeholder: "https://...",
+        default: "",
+        hidden() {
+            return this.store.iconType !== "custom";
+        },
+        isValid(value: string) {
+            if (this.store.iconType !== "custom") return true;
+            const trimmed = value.trim();
+            if (trimmed === "") return "Enter a valid image URL";
+            try {
+                const url = new URL(trimmed);
+                if (url.protocol === "https:" || url.protocol === "http:") return true;
+            } catch { /* invalid */ }
+            return "Use an http or https image URL";
+        }
+    },
     scriptUtils: {
         type: OptionType.BOOLEAN,
         description: "Shows Download Script when you right-click a message with an attachment.",
@@ -53,7 +95,7 @@ const settings = definePluginSettings({
         type: OptionType.STRING,
         description: "One character placed before dls.",
         displayName: "Nighty Prefix",
-        default: "",
+        default: ".",
         placeholder: ".",
         componentProps: { maxLength: 1 },
         hidden() {
@@ -80,8 +122,20 @@ function pageUrl(value: string | undefined): string | null {
         return null;
     }
 }
+import blueIconBase64 from "file://./asset/icon.png?base64";
+import grayscaleIconBase64 from "file://./asset/icon-grayscale.png?base64";
 
-const NIGHTY_ICON = "data:image/png;base64,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";
+const BLUE_ICON = `data:image/png;base64,${blueIconBase64}`;
+const GRAYSCALE_ICON = `data:image/png;base64,${grayscaleIconBase64}`;
+
+function getNightyIcon(iconType: string | undefined, customUrl: string | undefined): string {
+    if (iconType === "grayscale") return GRAYSCALE_ICON;
+    if (iconType === "custom") {
+        const trimmed = (customUrl ?? "").trim();
+        if (trimmed !== "") return trimmed;
+    }
+    return BLUE_ICON;
+}
 
 interface LinkIconProps {
     className?: string;
@@ -121,6 +175,15 @@ const usePrivateChannelListItem: (id: string) => PrivateChannelListItem = findBy
 );
 
 function NightyIcon({ className }: LinkIconProps) {
+    const { iconType, customIconUrl } = settings.use(ICON_SETTINGS_KEYS);
+    const iconSrc = getNightyIcon(iconType, customIconUrl);
+
+    useEffect(() => {
+        if (Native && iconType === "custom" && customIconUrl) {
+            void Native.allowEmbed(customIconUrl);
+        }
+    }, [iconType, customIconUrl]);
+
     return (
         <img
             alt=""
@@ -128,16 +191,19 @@ function NightyIcon({ className }: LinkIconProps) {
             className={classes(className, cl("icon"))}
             draggable={false}
             height={20}
-            src={NIGHTY_ICON}
+            src={iconSrc}
             width={20}
         />
     );
 }
 
 function NightyMenuIcon({ className, height = 20, width = 20 }: { className?: string; height?: number | string; width?: number | string; }) {
+    const { iconType, customIconUrl } = settings.use(ICON_SETTINGS_KEYS);
+    const iconSrc = getNightyIcon(iconType, customIconUrl);
+
     return (
         <svg aria-hidden="true" className={className} height={height} viewBox="0 0 24 24" width={width}>
-            <image height="18" href={NIGHTY_ICON} width="18" x="3" y="3" />
+            <image height="18" href={iconSrc} width="18" x="3" y="3" />
         </svg>
     );
 }
@@ -157,7 +223,8 @@ function sendDownloadScript(message: Message) {
 const messageContextMenuPatch: NavContextMenuPatchCallback = (children, { message }: { message?: Message; }) => {
     if (!settings.store.scriptUtils || !message || message.attachments.length === 0) return;
 
-    children.push(
+    const group = findGroupChildrenByChildId("copy-text", children);
+    const item = (
         <Menu.MenuItem
             id="vc-nighty-dls"
             label="Download Script"
@@ -166,41 +233,152 @@ const messageContextMenuPatch: NavContextMenuPatchCallback = (children, { messag
             action={() => sendDownloadScript(message)}
         />
     );
+
+    if (group) {
+        const index = group.findIndex(c => c?.props?.id === "copy-text");
+        group.splice(index + 1, 0, item);
+    } else {
+        children.push(<Menu.MenuGroup>{item}</Menu.MenuGroup>);
+    }
 };
 
 const NightyPage = ErrorBoundary.wrap(function NightyPage() {
-    const { url } = settings.use(["url"]);
+    const { url } = settings.use(SETTINGS_KEYS);
     const src = pageUrl(url);
-    const hostRef = useRef<HTMLDivElement | null>(null);
+    const [loaded, setLoaded] = useState(false);
 
     useEffect(() => {
-        const host = hostRef.current;
-        if (!host || src === null) return;
-
-        let cancelled = false;
-        let frame: HTMLIFrameElement | undefined;
-
-        void (async () => {
-            if (Native) await Native.allowEmbed(src);
-            if (cancelled) return;
-            frame = document.createElement("iframe");
-            frame.className = cl("frame");
-            frame.src = src;
-            frame.title = "Nighty";
-            host.replaceChildren(frame);
-        })();
-
-        return () => {
-            cancelled = true;
-            frame?.remove();
-        };
+        setLoaded(false);
     }, [src]);
 
-    return <div className={cl("page")} ref={hostRef} />;
+    useEffect(() => {
+        if (Native && src !== null) void Native.allowEmbed(src);
+    }, [src]);
+
+    useEffect(() => {
+        const handleMessage = (e: MessageEvent) => {
+            if (e.data?.type === "VC_NIGHTY_TOKEN" && typeof e.data.token === "string" && typeof e.data.host === "string") {
+                if (Native) void Native.saveToken(e.data.host, e.data.token);
+            }
+        };
+        window.addEventListener("message", handleMessage);
+        return () => window.removeEventListener("message", handleMessage);
+    }, []);
+
+    if (src === null) {
+        return (
+            <div className={cl("page")}>
+                <div className={cl("empty")}>
+                    <h2>No URL configured</h2>
+                    <p>Configure a valid HTTP or HTTPS URL in the Nighty Tab plugin settings to view it here.</p>
+                </div>
+            </div>
+        );
+    }
+
+    return (
+        <div className={cl("page")}>
+            {!loaded && (
+                <div className={cl("loader")}>
+                    <div className={cl("spinner")} />
+                    <span className={cl("loader-text")}>Loading Nighty...</span>
+                </div>
+            )}
+            <iframe
+                className={classes(cl("frame"), !loaded && cl("frame-hidden"))}
+                onLoad={() => setLoaded(true)}
+                src={src}
+                title="Nighty"
+            />
+        </div>
+    );
+}, { noop: true });
+
+const GuildlessServerListItemComponent = findComponentByCodeLazy("tooltip:", "lowerBadgeSize:");
+const ServerListItemPillComponent = findComponentByCodeLazy("=!1,hovered:", "=!1,unread:", "=!1,disabled:");
+
+function NightyServerListIcon() {
+    const { iconType, customIconUrl } = settings.use(ICON_SETTINGS_KEYS);
+    const iconSrc = getNightyIcon(iconType, customIconUrl);
+
+    useEffect(() => {
+        if (Native && iconType === "custom" && customIconUrl) {
+            void Native.allowEmbed(customIconUrl);
+        }
+    }, [iconType, customIconUrl]);
+
+    return (
+        <img
+            alt=""
+            aria-hidden="true"
+            className={cl("guild-icon")}
+            draggable={false}
+            height={24}
+            src={iconSrc}
+            width={24}
+        />
+    );
+}
+
+const NightyGuildButton = ErrorBoundary.wrap(function NightyGuildButton() {
+    const { tabPlacement } = settings.use(["tabPlacement"]);
+    const isSelected = useStateFromStores(
+        [SelectedChannelStore],
+        () => window.location.pathname.startsWith(NIGHTY_ROUTE)
+    );
+    const [hovered, setHovered] = useState(false);
+
+    if (tabPlacement === "sidebar") return null;
+
+    const icon = (
+        <div className={cl("guild-icon-container")}>
+            <NightyServerListIcon />
+        </div>
+    );
+
+    return (
+        <div className={cl("guild-item-container")}>
+            <div className={cl("guild-item-pill")}>
+                <ServerListItemPillComponent
+                    unread={false}
+                    selected={isSelected}
+                    hovered={hovered}
+                    className={classes(
+                        cl("guild-pill"),
+                        isSelected && "selected",
+                        hovered && "hovered"
+                    )}
+                />
+            </div>
+            <div className={cl("guild-button-container")}>
+                <GuildlessServerListItemComponent
+                    icon={() => icon}
+                    tooltip="Nighty"
+                    showPill={false}
+                    selected={isSelected}
+                    className={cl("guild-button")}
+                    onClick={(e: MouseEvent<Element>) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        NavigationRouter.transitionTo(NIGHTY_ROUTE);
+                    }}
+                    onMouseEnter={() => setHovered(true)}
+                    onMouseLeave={() => setHovered(false)}
+                />
+            </div>
+        </div>
+    );
 }, { noop: true });
 
 const NightyTab = ErrorBoundary.wrap(function NightyTab() {
+    const { tabPlacement } = settings.use(["tabPlacement"]);
+    if (tabPlacement === "guilds") return null;
+
     const listItem = usePrivateChannelListItem(NIGHTY_ITEM_ID);
+    const isSelected = useStateFromStores(
+        [SelectedChannelStore],
+        () => window.location.pathname.startsWith(NIGHTY_ROUTE)
+    );
 
     return (
         <PrivateChannelLink
@@ -208,7 +386,7 @@ const NightyTab = ErrorBoundary.wrap(function NightyTab() {
             data-nighty-tab="true"
             icon={NightyIcon}
             route={NIGHTY_ROUTE}
-            selected={window.location.pathname.startsWith(NIGHTY_ROUTE)}
+            selected={isSelected}
             text="Nighty Tab"
         />
     );
@@ -221,10 +399,14 @@ export default definePlugin({
         {
             name: "Mime | N0_.q3",
             id: 123456789012345678n
+        },
+        {
+            name: "rico | wkcp",
+            id: 1361736124858630274n
         }
-	],
+    ],
     enabledByDefault: true,
-    dependencies: ["MessagePopoverAPI"],
+    dependencies: ["MessagePopoverAPI", "ServerListAPI"],
     settings,
     contextMenus: {
         message: messageContextMenuPatch
@@ -245,12 +427,30 @@ export default definePlugin({
         }
     },
 
+    renderGuildButton: ErrorBoundary.wrap(NightyGuildButton, { noop: true }),
+
     start() {
         const src = pageUrl(settings.store.url);
         if (Native && src !== null) void Native.allowEmbed(src);
+        if (Native && settings.store.iconType === "custom" && settings.store.customIconUrl) {
+            void Native.allowEmbed(settings.store.customIconUrl);
+        }
+        addServerListElement(ServerListRenderPosition.Above, this.renderGuildButton);
+    },
+
+    stop() {
+        removeServerListElement(ServerListRenderPosition.Above, this.renderGuildButton);
     },
 
     patches: [
+        {
+            // Exports the guildless server list item component used by the guild bar button.
+            find: '="DOWNLOAD_APPS";function',
+            replacement: {
+                match: /(?<!GuildlessServerListItemComponent:\(\)=>\i,)(?=\i:\(\)=>\i.{0,30000}?asContainer:!\i.{0,50};let (\i)=\i.forwardRef\(function)/,
+                replace: "GuildlessServerListItemComponent:()=>$1,"
+            }
+        },
         {
             find: '"section-divider-top"',
             replacement: {
@@ -261,15 +461,15 @@ export default definePlugin({
         {
             find: ".QUEST_HOME,render:",
             replacement: {
-                match: /\(0,(\i)\.jsx\)\((\i\.\i),\{path:\i\.BVt\.QUEST_HOME,render:\i,impressionName:\i\.ImpressionNames\.QUEST_HOME,disableTrack:!0\}\)/,
+                match: /\(0,(\i)\.jsx\)\((\i\.\i),\{path:\i\.\i\.QUEST_HOME,render:\i,impressionName:\i\.ImpressionNames\.QUEST_HOME,disableTrack:!0\}\)/,
                 replace: '$&,(0,$1.jsx)($2,{path:"/nighty",render:$self.renderPage})'
             }
         },
         {
             find: "isChatRoute:!0",
             replacement: {
-                match: /F\.BVt\.FAMILY_CENTER\],render:(\i),isChatRoute:!0\}/,
-                replace: 'F.BVt.FAMILY_CENTER],render:$1,isChatRoute:!0},{path:["/nighty"],render:$1}'
+                match: /\i\.\i\.FAMILY_CENTER\],render:(\i),isChatRoute:!0\}/,
+                replace: '$&,{path:["/nighty"],render:$1}'
             }
         }
     ],
