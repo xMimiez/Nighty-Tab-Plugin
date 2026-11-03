@@ -7,6 +7,8 @@
 import { addBeforeSendHeadersHook, addResponseHeaderHook, CspPolicies, CSPSrc } from "@main/csp";
 import { app, BrowserWindow, IpcMainInvokeEvent, session, WebFrameMain } from "electron";
 
+CspPolicies["http://localhost:*"] = CSPSrc;
+
 const MONTH_SECONDS = 60 * 60 * 24 * 30;
 const embedHosts = new Set<string>();
 const cachedTokens = new Map<string, string>();
