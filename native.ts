@@ -13,7 +13,10 @@ import { join } from "path";
 // so Discord's page can iframe the configured host. It does not add script-src.
 const CSPSrc = ["style-src", "connect-src", "img-src", "frame-src", "font-src", "media-src", "worker-src"];
 
+const LOCAL_HTTP_SOURCES = ["http://localhost:*", "http://127.0.0.1:*"];
+
 CspPolicies["http://localhost:*"] = CSPSrc;
+CspPolicies["http://127.0.0.1:*"] = CSPSrc;
 
 const MONTH_SECONDS = 60 * 60 * 24 * 30;
 const embedHosts = new Set<string>();
@@ -181,13 +184,15 @@ function publishEmbed(url: string): boolean {
     return !known;
 }
 
+function frameSources(): string[] {
+    return [...LOCAL_HTTP_SOURCES, ...embedSources];
+}
+
 function grantEmbedInPolicy(policy: string): string {
-    if (embedSources.size === 0) return policy;
     const parsed = parsePolicy(policy);
-    const sources = [...embedSources];
     for (const directive of CSPSrc) {
         const bucket = parsed[directive] ?? (parsed[directive] = [...(parsed["default-src"] ?? [])]);
-        for (const source of sources) {
+        for (const source of frameSources()) {
             if (!bucket.includes(source)) bucket.push(source);
         }
     }
@@ -196,12 +201,25 @@ function grantEmbedInPolicy(policy: string): string {
 
 function grantEmbedFrame(headers: HeaderMap | undefined, resourceType: string | undefined) {
     if (!headers || resourceType !== "mainFrame") return;
-    documentSources = new Set(embedSources);
-    if (embedSources.size === 0) return;
+    documentSources = new Set(frameSources());
     for (const name of Object.keys(headers)) {
         if (name.toLowerCase() !== "content-security-policy") continue;
         headers[name] = headers[name].map(grantEmbedInPolicy).filter(policy => policy !== "");
     }
+}
+
+function documentAllows(url: string): boolean {
+    if (!documentSources) return false;
+    const host = hostOf(url);
+    if (host !== "" && documentSources.has(host)) return true;
+    try {
+        const parsed = new URL(url);
+        if (documentSources.has(parsed.origin)) return true;
+        if (parsed.protocol === "http:" && (parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1")) {
+            return documentSources.has(`${parsed.protocol}//${parsed.hostname}:*`);
+        }
+    } catch { /* invalid URL */ }
+    return false;
 }
 
 function savedEmbedUrls(): string[] {
@@ -397,14 +415,7 @@ export function allowEmbed(_event: IpcMainInvokeEvent, url: unknown) {
     if (host !== "") {
         const added = publishEmbed(url);
         registerHooks();
-        if (added && documentSources && !documentSources.has(host)) {
-            try {
-                const origin = new URL(url).origin;
-                if (!documentSources.has(origin)) reloadDiscord();
-            } catch {
-                reloadDiscord();
-            }
-        }
+        if (added && documentSources && !documentAllows(url)) reloadDiscord();
 
         try {
             session.defaultSession.preconnect({ url, numSockets: 2 });
