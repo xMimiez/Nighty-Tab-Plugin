@@ -4,8 +4,12 @@
  * SPDX-License-Identifier: MIT
  */
 
-import { addBeforeSendHeadersHook, addResponseHeaderHook, CspPolicies, CSPSrc } from "@main/csp";
+import { CspPolicies } from "@main/csp";
 import { app, BrowserWindow, IpcMainInvokeEvent, session, WebFrameMain } from "electron";
+
+// Equicord stopped exporting CSPSrc. This is that old list, including frame-src,
+// so Discord's page can iframe the configured host. It does not add script-src.
+const CSPSrc = ["style-src", "connect-src", "img-src", "frame-src", "font-src", "media-src", "worker-src"];
 
 CspPolicies["http://localhost:*"] = CSPSrc;
 
@@ -124,36 +128,148 @@ function attachWindow(win: BrowserWindow) {
     }
 }
 
+type HeaderMap = Record<string, string[]>;
+
+type HeadersResult = {
+    cancel?: boolean;
+    responseHeaders?: HeaderMap;
+    statusLine?: string;
+};
+
+type HeaderListener = (details: { url: string; responseHeaders?: HeaderMap; }, callback: (result: HeadersResult) => void) => void;
+
+function relaxEmbedResponse(url: string, headers: HeaderMap | undefined) {
+    if (!headers) return;
+    const host = hostOf(url);
+    if (!embedHosts.has(host)) return;
+
+    allowEmbedDocument(headers);
+
+    const key = Object.keys(headers).find(name => name.toLowerCase() === "set-cookie");
+    const cookies = key === undefined ? undefined : headers[key];
+    if (key !== undefined && cookies) {
+        headers[key] = cookies.map(cookie => keepEmbedCookie(url, cookie));
+    }
+}
+
+function injectEmbedCookie(url: string, requestHeaders: Record<string, string>) {
+    const host = hostOf(url);
+    if (!embedHosts.has(host)) return;
+
+    const token = cachedTokens.get(host);
+    if (!token) return;
+
+    const existing = requestHeaders.Cookie || requestHeaders.cookie || "";
+    if (!existing.includes("access_token=")) {
+        requestHeaders.Cookie = existing ? `${existing}; access_token=${token}` : `access_token=${token}`;
+    }
+}
+
+let requestHooksInstalled = false;
+
+// Plugin natives load before initCsp. Equicord then registers one onHeadersReceived
+// listener and replaces the method with a noop, so a later registration never runs.
+// Own the listener first, keep Equicord's callback, and ignore that replacement.
+function installRequestHooks() {
+    if (requestHooksInstalled) return;
+    requestHooksInstalled = true;
+
+    const webRequest = session.defaultSession.webRequest;
+    const originalOnHeadersReceived = webRequest.onHeadersReceived.bind(webRequest);
+    const originalOnBeforeSendHeaders = webRequest.onBeforeSendHeaders.bind(webRequest);
+
+    let equicordHeaders: HeaderListener | null = null;
+
+    originalOnHeadersReceived((details, callback) => {
+        const finish = (result: HeadersResult | null | undefined) => {
+            const responseHeaders = result?.responseHeaders ?? details.responseHeaders;
+            relaxEmbedResponse(details.url, responseHeaders);
+            const next: HeadersResult = {
+                cancel: result?.cancel ?? false,
+                responseHeaders
+            };
+            if (result?.statusLine !== undefined) next.statusLine = result.statusLine;
+            callback(next);
+        };
+
+        if (!equicordHeaders) {
+            finish({ responseHeaders: details.responseHeaders });
+            return;
+        }
+
+        let settled = false;
+        try {
+            equicordHeaders(details, result => {
+                if (settled) return;
+                settled = true;
+                finish(result);
+            });
+        } catch (error) {
+            console.error("[Nighty Tab] Embed header hook failed", error);
+            if (!settled) finish({ responseHeaders: details.responseHeaders });
+        }
+    });
+
+    const captureEquicordHeaders = (...args: unknown[]) => {
+        if (equicordHeaders) return;
+        const listener = args.length >= 2 ? args[1] : args[0];
+        if (typeof listener === "function") equicordHeaders = listener as HeaderListener;
+    };
+
+    const lockHeadersRegistration = () => {
+        Object.defineProperty(webRequest, "onHeadersReceived", {
+            configurable: true,
+            enumerable: true,
+            get: () => captureEquicordHeaders,
+            set: () => { }
+        });
+    };
+
+    try {
+        lockHeadersRegistration();
+    } catch (error) {
+        console.error("[Nighty Tab] Could not keep the embed header listener", error);
+        try {
+            const realWebRequest = webRequest;
+            const proxied = new Proxy(realWebRequest, {
+                get(target, prop, receiver) {
+                    if (prop === "onHeadersReceived") return captureEquicordHeaders;
+                    const value = Reflect.get(target, prop, receiver);
+                    return typeof value === "function" ? value.bind(target) : value;
+                },
+                set(target, prop, value, receiver) {
+                    if (prop === "onHeadersReceived") return true;
+                    return Reflect.set(target, prop, value, receiver);
+                }
+            });
+            Object.defineProperty(session.defaultSession, "webRequest", {
+                configurable: true,
+                enumerable: true,
+                get: () => proxied
+            });
+        } catch (proxyError) {
+            console.error("[Nighty Tab] Could not wrap the embed header listener", proxyError);
+        }
+    }
+
+    originalOnBeforeSendHeaders((details, callback) => {
+        const requestHeaders = { ...(details.requestHeaders ?? {}) };
+        injectEmbedCookie(details.url, requestHeaders);
+        callback({ cancel: false, requestHeaders });
+    });
+}
+
+app.whenReady().then(() => {
+    try {
+        installRequestHooks();
+    } catch (error) {
+        console.error("[Nighty Tab] Failed to install embed request hooks", error);
+    }
+});
+
 function registerHooks() {
     if (hooksRegistered) return;
     hooksRegistered = true;
-
-    addResponseHeaderHook(({ url, responseHeaders }) => {
-        if (!responseHeaders) return;
-        const host = hostOf(url);
-        if (!embedHosts.has(host)) return;
-
-        allowEmbedDocument(responseHeaders);
-
-        const key = Object.keys(responseHeaders).find(name => name.toLowerCase() === "set-cookie");
-        const cookies = key === undefined ? undefined : responseHeaders[key];
-        if (key !== undefined && cookies) {
-            responseHeaders[key] = cookies.map(cookie => keepEmbedCookie(url, cookie));
-        }
-    });
-
-    addBeforeSendHeadersHook(({ url, requestHeaders }) => {
-        const host = hostOf(url);
-        if (!embedHosts.has(host)) return;
-
-        const token = cachedTokens.get(host);
-        if (!token) return;
-
-        const existing = requestHeaders.Cookie || requestHeaders.cookie || "";
-        if (!existing.includes("access_token=")) {
-            requestHeaders.Cookie = existing ? `${existing}; access_token=${token}` : `access_token=${token}`;
-        }
-    });
 
     app.on("browser-window-created", (_, win) => attachWindow(win));
     for (const win of BrowserWindow.getAllWindows()) {

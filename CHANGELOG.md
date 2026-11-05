@@ -2,6 +2,10 @@
 
 All changes made to Nighty Tab Plugin and related Equicord integration files.
 
+## Equicord CSP build
+
+- **Removed exports**: Current Equicord no longer exports `CSPSrc`, `addResponseHeaderHook`, or `addBeforeSendHeadersHook`, so `native.ts` failed to compile. The plugin keeps the old directive list locally, including `frame-src`, and registers its own header and cookie listeners before Equicord locks `onHeadersReceived`.
+
 ## Login refresh
 
 - **Cookie scheme**: Login pages set an `access_token` cookie and then reload. The embed was rewriting every cookie to `Secure; SameSite=None; Partitioned`. That attribute set is rejected on `http://ip:port`, and a partitioned cookie is not the one the iframe sends on reload, so the reload returned to the login screen. `https` embeds now get `Secure; SameSite=None` only. `http` embeds keep the cookie the page set.
