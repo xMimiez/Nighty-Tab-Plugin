@@ -5,6 +5,7 @@ All changes made to Nighty Tab Plugin and related Equicord integration files.
 ## Equicord CSP build
 
 - **Removed exports**: Current Equicord no longer exports `CSPSrc`, `addResponseHeaderHook`, or `addBeforeSendHeadersHook`, so `native.ts` failed to compile. The plugin keeps the old directive list locally, including `frame-src`, and registers its own header and cookie listeners before Equicord locks `onHeadersReceived`.
+- **Embedded pages**: Discord's `frame-src` list is fixed when the Discord window loads. The saved Nighty URL is added to that list before the document is served. Changing the URL reloads Discord once so the new address can load in the tab.
 
 ## Login refresh
 

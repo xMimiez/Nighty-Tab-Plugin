@@ -6,6 +6,8 @@
 
 import { CspPolicies } from "@main/csp";
 import { app, BrowserWindow, IpcMainInvokeEvent, session, WebFrameMain } from "electron";
+import { readFileSync } from "fs";
+import { join } from "path";
 
 // Equicord stopped exporting CSPSrc. This is that old list, including frame-src,
 // so Discord's page can iframe the configured host. It does not add script-src.
@@ -15,8 +17,11 @@ CspPolicies["http://localhost:*"] = CSPSrc;
 
 const MONTH_SECONDS = 60 * 60 * 24 * 30;
 const embedHosts = new Set<string>();
+const embedSources = new Set<string>();
 const cachedTokens = new Map<string, string>();
 let hooksRegistered = false;
+// Sources that were copied into the Discord document that is open now.
+let documentSources: Set<string> | null = null;
 
 function hostOf(url: string): string {
     try {
@@ -136,7 +141,113 @@ type HeadersResult = {
     statusLine?: string;
 };
 
-type HeaderListener = (details: { url: string; responseHeaders?: HeaderMap; }, callback: (result: HeadersResult) => void) => void;
+type HeaderDetails = { url: string; resourceType?: string; responseHeaders?: HeaderMap };
+
+type HeaderListener = (details: HeaderDetails, callback: (result: HeadersResult) => void) => void;
+
+function parsePolicy(policy: string): HeaderMap {
+    const result: HeaderMap = {};
+    for (const directive of policy.split(";")) {
+        const [directiveKey, ...directiveValue] = directive.trim().split(/\s+/g);
+        if (directiveKey && !Object.prototype.hasOwnProperty.call(result, directiveKey)) {
+            result[directiveKey] = directiveValue;
+        }
+    }
+    return result;
+}
+
+function stringifyPolicy(policy: HeaderMap): string {
+    return Object.entries(policy)
+        .filter(([, values]) => values?.length)
+        .map(directive => directive.flat().join(" "))
+        .join("; ");
+}
+
+// Returns true when this host was not already allowed.
+function publishEmbed(url: string): boolean {
+    const host = hostOf(url);
+    if (host === "") return false;
+    const known = embedHosts.has(host);
+    embedHosts.add(host);
+    embedSources.add(host);
+    try {
+        const origin = new URL(url).origin;
+        if (origin && origin !== "null") {
+            embedSources.add(origin);
+            CspPolicies[origin] = CSPSrc;
+        }
+    } catch { /* ignore invalid URL */ }
+    CspPolicies[host] = CSPSrc;
+    return !known;
+}
+
+function grantEmbedInPolicy(policy: string): string {
+    if (embedSources.size === 0) return policy;
+    const parsed = parsePolicy(policy);
+    const sources = [...embedSources];
+    for (const directive of CSPSrc) {
+        const bucket = parsed[directive] ?? (parsed[directive] = [...(parsed["default-src"] ?? [])]);
+        for (const source of sources) {
+            if (!bucket.includes(source)) bucket.push(source);
+        }
+    }
+    return stringifyPolicy(parsed);
+}
+
+function grantEmbedFrame(headers: HeaderMap | undefined, resourceType: string | undefined) {
+    if (!headers || resourceType !== "mainFrame") return;
+    documentSources = new Set(embedSources);
+    if (embedSources.size === 0) return;
+    for (const name of Object.keys(headers)) {
+        if (name.toLowerCase() !== "content-security-policy") continue;
+        headers[name] = headers[name].map(grantEmbedInPolicy).filter(policy => policy !== "");
+    }
+}
+
+function savedEmbedUrls(): string[] {
+    const urls: string[] = [];
+    const files = new Set<string>();
+    const roots: string[] = [];
+    try {
+        const userData = app.getPath("userData");
+        roots.push(join(userData, "..", "Equicord"));
+        roots.push(join(userData, "..", "EquicordData"));
+        roots.push(join(userData, "..", "Vencord"));
+    } catch { /* user data is unavailable before ready */ }
+    if (process.env.EQUICORD_USER_DATA_DIR) roots.push(process.env.EQUICORD_USER_DATA_DIR);
+    if (process.env.DISCORD_USER_DATA_DIR) roots.push(join(process.env.DISCORD_USER_DATA_DIR, "..", "EquicordData"));
+    for (const root of roots) {
+        files.add(join(root, "settings", "settings.json"));
+        files.add(join(root, "dev", "settings", "settings.json"));
+    }
+
+    for (const file of files) {
+        try {
+            const parsed = JSON.parse(readFileSync(file, "utf-8"));
+            const plugins = parsed?.plugins;
+            if (!plugins || typeof plugins !== "object") continue;
+            for (const name of ["Nighty Tab", "ExtraHomeTab"]) {
+                const entry = plugins[name];
+                if (!entry || typeof entry !== "object") continue;
+                if (typeof entry.url === "string") urls.push(entry.url);
+                if (entry.iconType === "custom" && typeof entry.customIconUrl === "string") urls.push(entry.customIconUrl);
+            }
+        } catch { /* missing or unreadable settings */ }
+    }
+    return urls;
+}
+
+function reloadDiscord() {
+    for (const win of BrowserWindow.getAllWindows()) {
+        try {
+            const current = win.webContents.getURL();
+            const host = new URL(current).hostname;
+            const discord = host === "discord.com" || host.endsWith(".discord.com") || host === "discordapp.com" || host.endsWith(".discordapp.com");
+            if (!discord) continue;
+            win.webContents.reload();
+        } catch { /* window is already closing */ }
+    }
+}
 
 function relaxEmbedResponse(url: string, headers: HeaderMap | undefined) {
     if (!headers) return;
@@ -174,6 +285,8 @@ function installRequestHooks() {
     if (requestHooksInstalled) return;
     requestHooksInstalled = true;
 
+    for (const savedUrl of savedEmbedUrls()) publishEmbed(savedUrl);
+
     const webRequest = session.defaultSession.webRequest;
     const originalOnHeadersReceived = webRequest.onHeadersReceived.bind(webRequest);
     const originalOnBeforeSendHeaders = webRequest.onBeforeSendHeaders.bind(webRequest);
@@ -184,6 +297,7 @@ function installRequestHooks() {
         const finish = (result: HeadersResult | null | undefined) => {
             const responseHeaders = result?.responseHeaders ?? details.responseHeaders;
             relaxEmbedResponse(details.url, responseHeaders);
+            grantEmbedFrame(responseHeaders, details.resourceType);
             const next: HeadersResult = {
                 cancel: result?.cancel ?? false,
                 responseHeaders
@@ -281,9 +395,16 @@ export function allowEmbed(_event: IpcMainInvokeEvent, url: unknown) {
     if (typeof url !== "string") return;
     const host = hostOf(url);
     if (host !== "") {
-        embedHosts.add(host);
-        CspPolicies[host] = CSPSrc;
+        const added = publishEmbed(url);
         registerHooks();
+        if (added && documentSources && !documentSources.has(host)) {
+            try {
+                const origin = new URL(url).origin;
+                if (!documentSources.has(origin)) reloadDiscord();
+            } catch {
+                reloadDiscord();
+            }
+        }
 
         try {
             session.defaultSession.preconnect({ url, numSockets: 2 });
