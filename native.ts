@@ -123,6 +123,18 @@ function nightySessionScript(token: string): string {
     }
     window.__vcNightyPatched = true;
     window.__vcNightyJar = jar;
+    try {
+        Location.prototype.reload = function() {};
+    } catch (e) {}
+    try {
+        if (window.navigation && !window.__vcNightyNav) {
+            window.__vcNightyNav = true;
+            navigation.addEventListener("navigate", (event) => {
+                if (event.navigationType !== "reload" || !event.cancelable) return;
+                event.preventDefault();
+            });
+        }
+    } catch (e) {}
     const desc = Object.getOwnPropertyDescriptor(Document.prototype, "cookie") ||
                  Object.getOwnPropertyDescriptor(HTMLDocument.prototype, "cookie");
     if (desc && desc.get && desc.set) {
