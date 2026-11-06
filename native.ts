@@ -38,12 +38,45 @@ function hostOf(url: string): string {
 
 function keepEmbedCookie(pageUrl: string, cookie: string): string {
     // SameSite=None requires Secure, and Secure cookies are dropped on http://ip:port.
+    // An iframe reload is third-party, so an https cookie also has to be Partitioned
+    // under Discord or Chromium will not send it. That attribute is set from the
+    // iframe response, where the top-level site is already known.
     if (!pageUrl.startsWith("https:")) return cookie;
 
     let next = cookie.replace(/;\s*samesite=[^;]*/gi, "").replace(/;\s*partitioned\b/gi, "").replace(/;\s*secure\b/gi, "");
-    next += "; Secure; SameSite=None";
+    next += "; Secure; SameSite=None; Partitioned";
     if (!/(?:^|;)\s*(?:expires|max-age)=/i.test(next)) next += `; Max-Age=${MONTH_SECONDS}`;
     return next;
+}
+
+function tokenFromSetCookie(cookie: string): string {
+    const match = /^access_token=([^;]*)/i.exec(cookie.trim());
+    if (!match || match[1] === "") return "";
+    try {
+        return decodeURIComponent(match[1]);
+    } catch {
+        return match[1];
+    }
+}
+
+function rememberToken(host: string, token: string, pageUrl: string) {
+    if (host === "" || token === "") return;
+    cachedTokens.set(host, token);
+    const secure = pageUrl.startsWith("https:");
+    // A partitioned cookie set from the main process has no top-level site, so the
+    // iframe does not send it. Header injection covers the reload. https responses
+    // still get Partitioned from keepEmbedCookie.
+    void session.defaultSession.cookies.set({
+        url: `${secure ? "https" : "http"}://${host}`,
+        name: "access_token",
+        value: token,
+        path: "/",
+        sameSite: secure ? "no_restriction" : "lax",
+        secure,
+        expirationDate: Math.floor(Date.now() / 1000) + MONTH_SECONDS
+    }).catch(error => {
+        console.error("[Nighty Tab] Failed to persist cookie in session", error);
+    });
 }
 
 function allowEmbedDocument(headers: Record<string, string[]>) {
@@ -84,7 +117,7 @@ const INJECT_SCRIPT = `
                 if (location.protocol !== "https:") return origSet.call(document, str);
                 const next = str.replace(/;\\s*samesite=[^;]*/gi, "").replace(/;\\s*partitioned\\b/gi, "").replace(/;\\s*secure\\b/gi, "");
                 try {
-                    return origSet.call(document, next + "; Secure; SameSite=None");
+                    return origSet.call(document, next + "; Secure; SameSite=None; Partitioned");
                 } catch {
                     return origSet.call(document, str);
                 }
@@ -98,17 +131,15 @@ const INJECT_SCRIPT = `
         try {
             const url = typeof args[0] === "string" ? args[0] : args[0]?.url || "";
             if (url.includes("/api/login")) {
-                const clone = res.clone();
-                clone.json().then(data => {
-                    if (data && data.access_token) {
-                        window.parent.postMessage({
-                            type: "VC_NIGHTY_TOKEN",
-                            token: data.access_token,
-                            host: window.location.host,
-                            protocol: window.location.protocol
-                        }, "*");
-                    }
-                }).catch(() => {});
+                const data = await res.clone().json();
+                if (data && data.access_token) {
+                    window.parent.postMessage({
+                        type: "VC_NIGHTY_TOKEN",
+                        token: data.access_token,
+                        host: window.location.host,
+                        protocol: window.location.protocol
+                    }, "*");
+                }
             }
         } catch {}
         return res;
@@ -144,7 +175,7 @@ type HeadersResult = {
     statusLine?: string;
 };
 
-type HeaderDetails = { url: string; resourceType?: string; responseHeaders?: HeaderMap };
+type HeaderDetails = { id?: number; url: string; statusCode?: number; resourceType?: string; responseHeaders?: HeaderMap };
 
 type HeaderListener = (details: HeaderDetails, callback: (result: HeadersResult) => void) => void;
 
@@ -277,8 +308,57 @@ function relaxEmbedResponse(url: string, headers: HeaderMap | undefined) {
     const key = Object.keys(headers).find(name => name.toLowerCase() === "set-cookie");
     const cookies = key === undefined ? undefined : headers[key];
     if (key !== undefined && cookies) {
+        for (const cookie of cookies) {
+            const token = tokenFromSetCookie(cookie);
+            if (token !== "") rememberToken(host, token, url);
+        }
         headers[key] = cookies.map(cookie => keepEmbedCookie(url, cookie));
     }
+}
+
+const capturedLoginRequests = new Set<number>();
+
+// The dashboard sets a cookie and reloads as soon as /api/login returns. Read the
+// token here, before that body reaches the page, so the reload request can send it.
+function captureEmbedLogin(details: HeaderDetails) {
+    if (typeof details.id !== "number" || capturedLoginRequests.has(details.id)) return;
+    if (!details.url.includes("/api/login")) return;
+    if (typeof details.statusCode === "number" && details.statusCode >= 300 && details.statusCode < 400) return;
+    const host = hostOf(details.url);
+    if (host === "" || !embedHosts.has(host)) return;
+
+    let filter: ReturnType<typeof session.defaultSession.webRequest.filterResponseData>;
+    try {
+        filter = session.defaultSession.webRequest.filterResponseData(details.id);
+    } catch {
+        return;
+    }
+    capturedLoginRequests.add(details.id);
+    const chunks: Buffer[] = [];
+    const release = () => capturedLoginRequests.delete(details.id!);
+    filter.on("data", (chunk: Buffer) => {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    });
+    filter.on("end", () => {
+        const body = Buffer.concat(chunks);
+        try {
+            const data = JSON.parse(body.toString("utf8")) as { access_token?: unknown };
+            if (typeof data.access_token === "string") rememberToken(host, data.access_token, details.url);
+        } catch { /* the login response was not JSON */ }
+        try {
+            filter.write(body);
+            filter.end();
+        } catch { /* the stream is already closed */ }
+        release();
+    });
+    filter.on("error", () => {
+        try {
+            const body = Buffer.concat(chunks);
+            if (body.length > 0) filter.write(body);
+            filter.end();
+        } catch { /* the stream is already closed */ }
+        release();
+    });
 }
 
 function injectEmbedCookie(url: string, requestHeaders: Record<string, string>) {
@@ -289,9 +369,12 @@ function injectEmbedCookie(url: string, requestHeaders: Record<string, string>) 
     if (!token) return;
 
     const existing = requestHeaders.Cookie || requestHeaders.cookie || "";
-    if (!existing.includes("access_token=")) {
-        requestHeaders.Cookie = existing ? `${existing}; access_token=${token}` : `access_token=${token}`;
-    }
+    const without = existing
+        .split(/;\s*/)
+        .filter(part => part !== "" && !/^access_token=/i.test(part))
+        .join("; ");
+    requestHeaders.Cookie = without === "" ? `access_token=${token}` : `${without}; access_token=${token}`;
+    if (requestHeaders.cookie !== undefined) delete requestHeaders.cookie;
 }
 
 let requestHooksInstalled = false;
@@ -315,6 +398,7 @@ function installRequestHooks() {
         const finish = (result: HeadersResult | null | undefined) => {
             const responseHeaders = result?.responseHeaders ?? details.responseHeaders;
             relaxEmbedResponse(details.url, responseHeaders);
+            captureEmbedLogin({ ...details, responseHeaders });
             grantEmbedFrame(responseHeaders, details.resourceType);
             const next: HeadersResult = {
                 cancel: result?.cancel ?? false,
@@ -435,18 +519,5 @@ export async function saveToken(_event: IpcMainInvokeEvent, host: unknown, token
     cachedTokens.set(host, token);
     embedHosts.add(host);
 
-    const secure = protocol === "https:";
-    try {
-        await session.defaultSession.cookies.set({
-            url: `${secure ? "https" : "http"}://${host}`,
-            name: "access_token",
-            value: token,
-            path: "/",
-            sameSite: secure ? "no_restriction" : "lax",
-            secure,
-            expirationDate: Math.floor(Date.now() / 1000) + MONTH_SECONDS
-        });
-    } catch (e) {
-        console.error("[Nighty Tab] Failed to persist cookie in session", e);
-    }
+    rememberToken(host, token, `${protocol === "https:" ? "https" : "http"}://${host}/`);
 }
