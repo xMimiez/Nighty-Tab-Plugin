@@ -8,6 +8,7 @@ import { CspPolicies } from "@main/csp";
 import { app, BrowserWindow, IpcMainInvokeEvent, session, WebFrameMain } from "electron";
 import { readFileSync } from "fs";
 import { join } from "path";
+import { brotliCompressSync, brotliDecompressSync, deflateSync, gzipSync, gunzipSync, inflateSync } from "zlib";
 
 // Equicord stopped exporting CSPSrc. This is that old list, including frame-src,
 // so Discord's page can iframe the configured host. It does not add script-src.
@@ -97,61 +98,95 @@ function allowEmbedDocument(headers: Record<string, string[]>) {
     }
 }
 
-const INJECT_SCRIPT = `
-(() => {
-    if (window.__vcNightyPatched) return;
+// Runs before the dashboard's own scripts. The reload checks document.cookie in the
+// page, and Chromium drops that third-party cookie, so the getter has to report the
+// token even when the jar refused to store it.
+function nightySessionScript(token: string): string {
+    const literal = JSON.stringify(token).replace(/</g, "\\u003c").replace(/\u2028/g, "\\u2028").replace(/\u2029/g, "\\u2029");
+    return `(() => {
+    const provided = ${literal};
+    const remember = (value) => {
+        if (typeof value !== "string" || value === "") return;
+        try { localStorage.setItem("access_token", value); } catch (e) {}
+    };
+    remember(provided);
+    let jar = "";
+    try {
+        const stored = localStorage.getItem("access_token") || provided;
+        if (stored) jar = "access_token=" + stored;
+    } catch (e) {
+        if (provided) jar = "access_token=" + provided;
+    }
+    if (window.__vcNightyPatched) {
+        if (jar) window.__vcNightyJar = jar;
+        return;
+    }
     window.__vcNightyPatched = true;
-
+    window.__vcNightyJar = jar;
     const desc = Object.getOwnPropertyDescriptor(Document.prototype, "cookie") ||
                  Object.getOwnPropertyDescriptor(HTMLDocument.prototype, "cookie");
-    if (desc && desc.set) {
-        const origSet = desc.set;
+    if (desc && desc.get && desc.set) {
         Object.defineProperty(document, "cookie", {
             configurable: true,
             enumerable: true,
             get() {
-                return desc.get.call(document);
+                let real = "";
+                try { real = String(desc.get.call(document) || ""); } catch (e) {}
+                const extra = window.__vcNightyJar || "";
+                if (!extra || real.indexOf("access_token=") !== -1) return real;
+                return real === "" ? extra : extra + "; " + real;
             },
             set(val) {
                 const str = String(val);
-                if (location.protocol !== "https:") return origSet.call(document, str);
-                const next = str.replace(/;\\s*samesite=[^;]*/gi, "").replace(/;\\s*partitioned\\b/gi, "").replace(/;\\s*secure\\b/gi, "");
-                try {
-                    return origSet.call(document, next + "; Secure; SameSite=None; Partitioned");
-                } catch {
-                    return origSet.call(document, str);
+                const match = /^access_token=([^;]*)/i.exec(str.trim());
+                if (match) {
+                    let next = match[1];
+                    try { next = decodeURIComponent(match[1]); } catch (e) {}
+                    if (next === "") {
+                        window.__vcNightyJar = "";
+                        try { localStorage.removeItem("access_token"); } catch (e) {}
+                    } else {
+                        window.__vcNightyJar = "access_token=" + next;
+                        remember(next);
+                        try {
+                            window.parent.postMessage({ type: "VC_NIGHTY_TOKEN", token: next, host: location.host, protocol: location.protocol }, "*");
+                        } catch (e) {}
+                    }
                 }
+                const secure = location.protocol === "https:";
+                const written = secure
+                    ? str.replace(/;\\s*samesite=[^;]*/gi, "").replace(/;\\s*partitioned\\b/gi, "").replace(/;\\s*secure\\b/gi, "") + "; Secure; SameSite=None; Partitioned"
+                    : str;
+                try { return desc.set.call(document, written); } catch (e) { return desc.set.call(document, str); }
             }
         });
     }
-
     const origFetch = window.fetch;
-    window.fetch = async function(...args) {
-        const res = await origFetch.apply(this, args);
-        try {
-            const url = typeof args[0] === "string" ? args[0] : args[0]?.url || "";
-            if (url.includes("/api/login")) {
-                const data = await res.clone().json();
-                if (data && data.access_token) {
-                    window.parent.postMessage({
-                        type: "VC_NIGHTY_TOKEN",
-                        token: data.access_token,
-                        host: window.location.host,
-                        protocol: window.location.protocol
-                    }, "*");
+    if (typeof origFetch === "function") {
+        window.fetch = async function(...args) {
+            const res = await origFetch.apply(this, args);
+            try {
+                const url = typeof args[0] === "string" ? args[0] : (args[0] && args[0].url) || "";
+                if (String(url).indexOf("/api/login") !== -1) {
+                    const data = await res.clone().json();
+                    if (data && typeof data.access_token === "string") {
+                        window.__vcNightyJar = "access_token=" + data.access_token;
+                        remember(data.access_token);
+                        window.parent.postMessage({ type: "VC_NIGHTY_TOKEN", token: data.access_token, host: location.host, protocol: location.protocol }, "*");
+                    }
                 }
-            }
-        } catch {}
-        return res;
-    };
-})();
-`;
+            } catch (e) {}
+            return res;
+        };
+    }
+})();`;
+}
 
 function injectFrame(frame: WebFrameMain) {
     try {
         const host = hostOf(frame.url);
         if (!embedHosts.has(host)) return;
-        frame.executeJavaScript(INJECT_SCRIPT).catch(() => {});
+        frame.executeJavaScript(nightySessionScript(cachedTokens.get(host) ?? "")).catch(() => {});
     } catch {}
 }
 
@@ -318,33 +353,38 @@ function relaxEmbedResponse(url: string, headers: HeaderMap | undefined) {
 
 const capturedLoginRequests = new Set<number>();
 
-// The dashboard sets a cookie and reloads as soon as /api/login returns. Read the
-// token here, before that body reaches the page, so the reload request can send it.
-function captureEmbedLogin(details: HeaderDetails) {
-    if (typeof details.id !== "number" || capturedLoginRequests.has(details.id)) return;
-    if (!details.url.includes("/api/login")) return;
-    if (typeof details.statusCode === "number" && details.statusCode >= 300 && details.statusCode < 400) return;
-    const host = hostOf(details.url);
-    if (host === "" || !embedHosts.has(host)) return;
+function headerValue(headers: HeaderMap | undefined, name: string): string {
+    if (!headers) return "";
+    const key = Object.keys(headers).find(item => item.toLowerCase() === name);
+    if (key === undefined) return "";
+    return headers[key].join(";");
+}
 
+function deleteHeader(headers: HeaderMap, name: string) {
+    for (const key of Object.keys(headers)) {
+        if (key.toLowerCase() === name) delete headers[key];
+    }
+}
+
+function filterResponse(id: number, onBody: (body: Buffer) => Buffer): boolean {
+    if (capturedLoginRequests.has(id)) return false;
     let filter: ReturnType<typeof session.defaultSession.webRequest.filterResponseData>;
     try {
-        filter = session.defaultSession.webRequest.filterResponseData(details.id);
+        filter = session.defaultSession.webRequest.filterResponseData(id);
     } catch {
-        return;
+        return false;
     }
-    capturedLoginRequests.add(details.id);
+    capturedLoginRequests.add(id);
     const chunks: Buffer[] = [];
-    const release = () => capturedLoginRequests.delete(details.id!);
+    const release = () => capturedLoginRequests.delete(id);
     filter.on("data", (chunk: Buffer) => {
         chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
     });
     filter.on("end", () => {
-        const body = Buffer.concat(chunks);
+        let body = Buffer.concat(chunks);
         try {
-            const data = JSON.parse(body.toString("utf8")) as { access_token?: unknown };
-            if (typeof data.access_token === "string") rememberToken(host, data.access_token, details.url);
-        } catch { /* the login response was not JSON */ }
+            body = onBody(body);
+        } catch { /* keep the original body */ }
         try {
             filter.write(body);
             filter.end();
@@ -359,6 +399,65 @@ function captureEmbedLogin(details: HeaderDetails) {
         } catch { /* the stream is already closed */ }
         release();
     });
+    return true;
+}
+
+// The dashboard sets a cookie and reloads as soon as /api/login returns. Read the
+// token here, before that body reaches the page, so the reload request can send it.
+function captureEmbedLogin(details: HeaderDetails): boolean {
+    if (typeof details.id !== "number") return false;
+    if (!details.url.includes("/api/login")) return false;
+    if (typeof details.statusCode === "number" && details.statusCode >= 300 && details.statusCode < 400) return false;
+    const host = hostOf(details.url);
+    if (host === "" || !embedHosts.has(host)) return false;
+
+    return filterResponse(details.id, body => {
+        try {
+            const data = JSON.parse(body.toString("utf8")) as { access_token?: unknown };
+            if (typeof data.access_token === "string") rememberToken(host, data.access_token, details.url);
+        } catch { /* the login response was not JSON */ }
+        return body;
+    });
+}
+
+function isEmbedHtml(details: HeaderDetails): boolean {
+    const host = hostOf(details.url);
+    if (host === "" || !embedHosts.has(host)) return false;
+    if (details.resourceType !== "subFrame" && details.resourceType !== "mainFrame") return false;
+    const type = headerValue(details.responseHeaders, "content-type").toLowerCase();
+    return type.includes("text/html") || type.includes("application/xhtml");
+}
+
+function rewriteBody(body: Buffer, encoding: string, prefix: Buffer): Buffer {
+    const apply = (plain: Buffer) => Buffer.concat([prefix, plain]);
+    const enc = encoding.toLowerCase();
+    try {
+        if (enc.includes("gzip")) return gzipSync(apply(gunzipSync(body)));
+        if (enc.includes("br")) return brotliCompressSync(apply(brotliDecompressSync(body)));
+        if (enc.includes("deflate")) return deflateSync(apply(inflateSync(body)));
+    } catch {
+        return body;
+    }
+    if (body.length >= 2 && body[0] === 0x1f && body[1] === 0x8b) return body;
+    return apply(body);
+}
+
+// The page script reads document.cookie as soon as it runs. Put the token in front
+// of that script. A header CSP must not block this bootstrap.
+function rewriteEmbedDocument(details: HeaderDetails): boolean {
+    if (typeof details.id !== "number" || !isEmbedHtml(details)) return false;
+    if (typeof details.statusCode === "number" && (details.statusCode < 200 || details.statusCode >= 300)) return false;
+    const headers = details.responseHeaders;
+    if (headers) {
+        deleteHeader(headers, "content-security-policy");
+        deleteHeader(headers, "content-security-policy-report-only");
+        deleteHeader(headers, "content-length");
+    }
+    const host = hostOf(details.url);
+    const token = cachedTokens.get(host) ?? "";
+    const prefix = Buffer.from(`<script>${nightySessionScript(token)}</script>`, "utf8");
+    const encoding = headerValue(headers, "content-encoding");
+    return filterResponse(details.id, body => rewriteBody(body, encoding, prefix));
 }
 
 function injectEmbedCookie(url: string, requestHeaders: Record<string, string>) {
@@ -398,7 +497,9 @@ function installRequestHooks() {
         const finish = (result: HeadersResult | null | undefined) => {
             const responseHeaders = result?.responseHeaders ?? details.responseHeaders;
             relaxEmbedResponse(details.url, responseHeaders);
-            captureEmbedLogin({ ...details, responseHeaders });
+            const received = { ...details, responseHeaders };
+            const captured = captureEmbedLogin(received);
+            if (!captured) rewriteEmbedDocument(received);
             grantEmbedFrame(responseHeaders, details.resourceType);
             const next: HeadersResult = {
                 cancel: result?.cancel ?? false,
@@ -426,23 +527,32 @@ function installRequestHooks() {
         }
     });
 
+    let equicordSendHeaders: ((details: { url: string; requestHeaders?: Record<string, string>; }, callback: (result: { cancel?: boolean; requestHeaders?: Record<string, string>; }) => void) => void) | null = null;
+
     const captureEquicordHeaders = (...args: unknown[]) => {
         if (equicordHeaders) return;
         const listener = args.length >= 2 ? args[1] : args[0];
         if (typeof listener === "function") equicordHeaders = listener as HeaderListener;
     };
 
-    const lockHeadersRegistration = () => {
-        Object.defineProperty(webRequest, "onHeadersReceived", {
+    const captureEquicordSendHeaders = (...args: unknown[]) => {
+        if (equicordSendHeaders) return;
+        const listener = args.length >= 2 ? args[1] : args[0];
+        if (typeof listener === "function") equicordSendHeaders = listener as NonNullable<typeof equicordSendHeaders>;
+    };
+
+    const lockRegistration = (method: "onHeadersReceived" | "onBeforeSendHeaders", capture: (...args: unknown[]) => void) => {
+        Object.defineProperty(webRequest, method, {
             configurable: true,
             enumerable: true,
-            get: () => captureEquicordHeaders,
+            get: () => capture,
             set: () => { }
         });
     };
 
     try {
-        lockHeadersRegistration();
+        lockRegistration("onHeadersReceived", captureEquicordHeaders);
+        lockRegistration("onBeforeSendHeaders", captureEquicordSendHeaders);
     } catch (error) {
         console.error("[Nighty Tab] Could not keep the embed header listener", error);
         try {
@@ -450,11 +560,12 @@ function installRequestHooks() {
             const proxied = new Proxy(realWebRequest, {
                 get(target, prop, receiver) {
                     if (prop === "onHeadersReceived") return captureEquicordHeaders;
+                    if (prop === "onBeforeSendHeaders") return captureEquicordSendHeaders;
                     const value = Reflect.get(target, prop, receiver);
                     return typeof value === "function" ? value.bind(target) : value;
                 },
                 set(target, prop, value, receiver) {
-                    if (prop === "onHeadersReceived") return true;
+                    if (prop === "onHeadersReceived" || prop === "onBeforeSendHeaders") return true;
                     return Reflect.set(target, prop, value, receiver);
                 }
             });
@@ -469,10 +580,42 @@ function installRequestHooks() {
     }
 
     originalOnBeforeSendHeaders((details, callback) => {
-        const requestHeaders = { ...(details.requestHeaders ?? {}) };
-        injectEmbedCookie(details.url, requestHeaders);
-        callback({ cancel: false, requestHeaders });
+        const finishSend = (result: { cancel?: boolean; requestHeaders?: Record<string, string>; } | null | undefined) => {
+            const requestHeaders = { ...(result?.requestHeaders ?? details.requestHeaders ?? {}) };
+            injectEmbedCookie(details.url, requestHeaders);
+            callback({ cancel: result?.cancel ?? false, requestHeaders });
+        };
+
+        if (!equicordSendHeaders) {
+            finishSend(null);
+            return;
+        }
+
+        let settled = false;
+        try {
+            equicordSendHeaders(details, result => {
+                if (settled) return;
+                settled = true;
+                finishSend(result);
+            });
+        } catch (error) {
+            console.error("[Nighty Tab] Embed request hook failed", error);
+            if (!settled) finishSend(null);
+        }
     });
+
+    hydrateSavedTokens();
+}
+
+function hydrateSavedTokens() {
+    for (const savedUrl of savedEmbedUrls()) {
+        const host = hostOf(savedUrl);
+        if (host === "") continue;
+        void session.defaultSession.cookies.get({ url: savedUrl, name: "access_token" }).then(found => {
+            const token = found.find(cookie => cookie.value)?.value ?? "";
+            if (token !== "" && !cachedTokens.has(host)) cachedTokens.set(host, token);
+        }).catch(() => { /* the jar has no saved Nighty session */ });
+    }
 }
 
 app.whenReady().then(() => {
