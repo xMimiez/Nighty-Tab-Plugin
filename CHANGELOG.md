@@ -13,7 +13,7 @@ All changes made to Nighty Tab Plugin and related Equicord integration files.
 - **Cookie scheme**: Login pages set an `access_token` cookie and then reload. The embed was rewriting every cookie to `Secure; SameSite=None; Partitioned`. That attribute set is rejected on `http://ip:port`, and a partitioned cookie created from the main process is not tied to Discord, so the reload returned to the login screen. `http` embeds keep the cookie the page set. `https` responses are partitioned from the iframe itself.
 - **Login reload**: The dashboard reloads as soon as `/api/login` returns, before the frame script can store the token. The main process now reads that response first and sends `access_token` on the next request, including `http` pages that cannot keep a third-party cookie.
 - **Login page check**: That reload still opened the sign-in screen because the dashboard reads `document.cookie` in the page, and Chromium does not keep the third-party cookie. The embedded document now gets the saved token before its own scripts run, and the cookie listener can no longer be replaced.
-- **No login reload**: The dashboard calls `location.reload()` after a successful login. Inside the Nighty tab that reload is now ignored, so the page stays where it is.
+- **Session cookie**: `https://nighty.mime.at` logs in with an HttpOnly `session` cookie and renders the dashboard on the next document. The embed now keeps every `Set-Cookie` from that host and sends those cookies on the following request. The iframe is allowed to reload into that dashboard. Discord itself is not reloaded. The document body is no longer rewritten, so a compressed dashboard cannot be corrupted on the way through.
 
 ## Render error fixes
 
