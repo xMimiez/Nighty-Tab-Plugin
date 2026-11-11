@@ -244,16 +244,32 @@ const messageContextMenuPatch: NavContextMenuPatchCallback = (children, { messag
 
 const NightyPage = ErrorBoundary.wrap(function NightyPage() {
     const { url } = settings.use(SETTINGS_KEYS);
-    const src = pageUrl(url);
+    const configured = pageUrl(url);
+    const [src, setSrc] = useState<string | null>(configured);
     const [loaded, setLoaded] = useState(false);
+
+    useEffect(() => {
+        if (configured === null) {
+            setSrc(null);
+            return;
+        }
+        let cancel = false;
+        const next = Native ? Native.localEmbedUrl(configured) : Promise.resolve(configured);
+        void Promise.resolve(next).then(value => {
+            if (!cancel) setSrc(value || configured);
+        });
+        return () => {
+            cancel = true;
+        };
+    }, [configured]);
 
     useEffect(() => {
         setLoaded(false);
     }, [src]);
 
     useEffect(() => {
-        if (Native && src !== null) void Native.allowEmbed(src);
-    }, [src]);
+        if (Native && configured !== null) void Native.allowEmbed(configured);
+    }, [configured]);
 
     useEffect(() => {
         const handleMessage = (e: MessageEvent) => {

@@ -6,7 +6,9 @@
 
 import { CspPolicies } from "@main/csp";
 import { app, BrowserWindow, IpcMainInvokeEvent, session, WebFrameMain } from "electron";
+import { createServer, request as httpRequest, IncomingMessage, ServerResponse } from "http";
 import { readFileSync } from "fs";
+import { connect as connectTcp } from "net";
 import { join } from "path";
 
 // Equicord stopped exporting CSPSrc. This is that old list, including frame-src,
@@ -338,6 +340,11 @@ function savedEmbedUrls(): string[] {
         roots.push(join(userData, "..", "EquicordData"));
         roots.push(join(userData, "..", "Vencord"));
     } catch { /* user data is unavailable before ready */ }
+    if (process.env.APPDATA) {
+        roots.push(join(process.env.APPDATA, "Equicord"));
+        roots.push(join(process.env.APPDATA, "EquicordData"));
+        roots.push(join(process.env.APPDATA, "Vencord"));
+    }
     if (process.env.EQUICORD_USER_DATA_DIR) roots.push(process.env.EQUICORD_USER_DATA_DIR);
     if (process.env.DISCORD_USER_DATA_DIR) roots.push(join(process.env.DISCORD_USER_DATA_DIR, "..", "EquicordData"));
     for (const root of roots) {
@@ -615,6 +622,161 @@ function hydrateSavedTokens() {
         }).catch(() => { /* the jar has no saved Nighty session */ });
     }
 }
+
+const PROXY_HOST = "127.0.0.1";
+let proxyPort = 0;
+let proxyTarget: URL | null = null;
+const proxyCookies = new Map<string, Map<string, string>>();
+let proxyListening = false;
+
+function remoteHttp(url: URL): boolean {
+    return url.protocol === "http:" && url.hostname !== "localhost" && url.hostname !== "127.0.0.1" && url.hostname !== "::1";
+}
+
+function proxyJar(origin: string): Map<string, string> {
+    let jar = proxyCookies.get(origin);
+    if (!jar) {
+        jar = new Map();
+        proxyCookies.set(origin, jar);
+    }
+    return jar;
+}
+
+function rememberProxyCookies(origin: string, setCookie: string | string[] | undefined) {
+    if (!setCookie) return;
+    const jar = proxyJar(origin);
+    for (const cookie of Array.isArray(setCookie) ? setCookie : [setCookie]) {
+        const pair = cookie.split(";")[0]?.trim() ?? "";
+        const eq = pair.indexOf("=");
+        if (eq <= 0) continue;
+        const name = pair.slice(0, eq).trim();
+        const value = pair.slice(eq + 1).trim();
+        if (value === "" || /(?:^|;)\s*max-age=(?:0|-)/i.test(cookie)) jar.delete(name);
+        else jar.set(name, value);
+    }
+}
+
+function proxyCookieHeader(origin: string, existing: string | string[] | undefined): string {
+    const parts = new Map<string, string>();
+    const raw = Array.isArray(existing) ? existing.join("; ") : (existing ?? "");
+    for (const part of raw.split(/;\s*/)) {
+        if (part === "") continue;
+        const eq = part.indexOf("=");
+        if (eq <= 0) continue;
+        parts.set(part.slice(0, eq).trim(), part.slice(eq + 1));
+    }
+    for (const [name, value] of proxyJar(origin)) parts.set(name, value);
+    return [...parts.entries()].map(([name, value]) => `${name}=${value}`).join("; ");
+}
+
+function rewriteProxyLocation(location: string, target: URL): string {
+    try {
+        const next = new URL(location, target);
+        if (next.origin !== target.origin || proxyPort === 0) return location;
+        return `http://${PROXY_HOST}:${proxyPort}${next.pathname}${next.search}${next.hash}`;
+    } catch {
+        return location;
+    }
+}
+
+function forwardHttp(req: IncomingMessage, res: ServerResponse) {
+    const target = proxyTarget;
+    if (!target || !req.url) {
+        res.writeHead(503);
+        res.end();
+        return;
+    }
+    const headers: Record<string, string | string[] | undefined> = { ...req.headers, host: target.host };
+    const cookie = proxyCookieHeader(target.origin, req.headers.cookie);
+    if (cookie !== "") headers.cookie = cookie;
+    const upstream = httpRequest({
+        hostname: target.hostname,
+        port: target.port || 80,
+        method: req.method,
+        path: req.url,
+        headers
+    }, upstreamRes => {
+        rememberProxyCookies(target.origin, upstreamRes.headers["set-cookie"]);
+        const responseHeaders = { ...upstreamRes.headers };
+        if (typeof responseHeaders.location === "string") responseHeaders.location = rewriteProxyLocation(responseHeaders.location, target);
+        res.writeHead(upstreamRes.statusCode || 502, responseHeaders);
+        upstreamRes.pipe(res);
+    });
+    upstream.on("error", () => {
+        if (!res.headersSent) res.writeHead(502);
+        res.end();
+    });
+    req.pipe(upstream);
+}
+
+function startEmbedProxy() {
+    if (proxyListening) return;
+    proxyListening = true;
+    const server = createServer(forwardHttp);
+    server.on("upgrade", (req, socket, head) => {
+        const target = proxyTarget;
+        if (!target) {
+            socket.destroy();
+            return;
+        }
+        const upstream = connectTcp(Number(target.port || 80), target.hostname, () => {
+            const lines = [`${req.method ?? "GET"} ${req.url ?? "/"} HTTP/1.1`, `Host: ${target.host}`];
+            for (const [key, value] of Object.entries(req.headers)) {
+                if (value === undefined || key.toLowerCase() === "host") continue;
+                const values = Array.isArray(value) ? value : [value];
+                for (const item of values) lines.push(`${key}: ${item}`);
+            }
+            upstream.write(`${lines.join("\r\n")}\r\n\r\n`);
+            if (head.length > 0) upstream.write(head);
+            socket.pipe(upstream);
+            upstream.pipe(socket);
+        });
+        const closeBoth = () => {
+            socket.destroy();
+            upstream.destroy();
+        };
+        upstream.on("error", closeBoth);
+        socket.on("error", closeBoth);
+    });
+    server.listen(0, PROXY_HOST, () => {
+        const address = server.address();
+        if (address && typeof address === "object") {
+            proxyPort = address.port;
+            console.log(`[Nighty Tab] HTTP embed proxy listening on ${proxyPort}`);
+        }
+    });
+}
+
+export function localEmbedUrl(_event: IpcMainInvokeEvent, url: unknown): Promise<string> {
+    if (typeof url !== "string" || url === "") return Promise.resolve("");
+    let parsed: URL;
+    try {
+        parsed = new URL(url);
+    } catch {
+        return Promise.resolve("");
+    }
+    if (!remoteHttp(parsed)) return Promise.resolve(parsed.href);
+    startEmbedProxy();
+    proxyTarget = new URL(parsed.href);
+    publishEmbed(parsed.href);
+    if (proxyPort !== 0) return Promise.resolve(`http://${PROXY_HOST}:${proxyPort}${parsed.pathname}${parsed.search}${parsed.hash}`);
+    return new Promise(resolve => {
+        const timer = setInterval(() => {
+            if (proxyPort === 0) return;
+            clearInterval(timer);
+            resolve(`http://${PROXY_HOST}:${proxyPort}${parsed.pathname}${parsed.search}${parsed.hash}`);
+        }, 20);
+    });
+}
+
+for (const savedUrl of savedEmbedUrls()) {
+    publishEmbed(savedUrl);
+    try {
+        const parsed = new URL(savedUrl);
+        if (remoteHttp(parsed)) proxyTarget = parsed;
+    } catch { /* ignore invalid saved URL */ }
+}
+startEmbedProxy();
 
 app.whenReady().then(() => {
     try {

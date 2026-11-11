@@ -7,6 +7,7 @@ All changes made to Nighty Tab Plugin and related Equicord integration files.
 - **Removed exports**: Current Equicord no longer exports `CSPSrc`, `addResponseHeaderHook`, or `addBeforeSendHeadersHook`, so `native.ts` failed to compile. The plugin keeps the old directive list locally, including `frame-src`, and registers its own header and cookie listeners before Equicord locks `onHeadersReceived`.
 - **Embedded pages**: Discord's `frame-src` list is fixed when the Discord window loads. The saved Nighty URL is added to that list before the document is served. Changing the URL reloads Discord once so the new address can load in the tab.
 - **Localhost**: Discord only allows `https://localhost:*`. The plugin also allows `http://localhost:*` and `http://127.0.0.1:*`, so any local port can load in the tab.
+- **HTTP addresses**: An https Discord page blocks a public `http://ip:port` frame, or upgrades it to `https://ip:port` and the frame hangs. Any remote http address is opened through `http://127.0.0.1`, which Discord already treats like localhost. A different host or port does not need its own exception.
 
 ## Login refresh
 
