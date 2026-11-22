@@ -122,11 +122,11 @@ function pageUrl(value: string | undefined): string | null {
         return null;
     }
 }
-import blueIconBase64 from "file://./asset/icon.png?base64";
-import grayscaleIconBase64 from "file://./asset/icon-grayscale.png?base64";
+import blueIconBase64 from "file://./asset/icon.webp?base64";
+import grayscaleIconBase64 from "file://./asset/icon-grayscale.webp?base64";
 
-const BLUE_ICON = `data:image/png;base64,${blueIconBase64}`;
-const GRAYSCALE_ICON = `data:image/png;base64,${grayscaleIconBase64}`;
+const BLUE_ICON = `data:image/webp;base64,${blueIconBase64}`;
+const GRAYSCALE_ICON = `data:image/webp;base64,${grayscaleIconBase64}`;
 
 function getNightyIcon(iconType: string | undefined, customUrl: string | undefined): string {
     if (iconType === "grayscale") return GRAYSCALE_ICON;
@@ -244,16 +244,32 @@ const messageContextMenuPatch: NavContextMenuPatchCallback = (children, { messag
 
 const NightyPage = ErrorBoundary.wrap(function NightyPage() {
     const { url } = settings.use(SETTINGS_KEYS);
-    const src = pageUrl(url);
+    const configured = pageUrl(url);
+    const [src, setSrc] = useState<string | null>(configured);
     const [loaded, setLoaded] = useState(false);
+
+    useEffect(() => {
+        if (configured === null) {
+            setSrc(null);
+            return;
+        }
+        let cancel = false;
+        const next = Native ? Native.localEmbedUrl(configured) : Promise.resolve(configured);
+        void Promise.resolve(next).then(value => {
+            if (!cancel) setSrc(value || configured);
+        });
+        return () => {
+            cancel = true;
+        };
+    }, [configured]);
 
     useEffect(() => {
         setLoaded(false);
     }, [src]);
 
     useEffect(() => {
-        if (Native && src !== null) void Native.allowEmbed(src);
-    }, [src]);
+        if (Native && configured !== null) void Native.allowEmbed(configured);
+    }, [configured]);
 
     useEffect(() => {
         const handleMessage = (e: MessageEvent) => {

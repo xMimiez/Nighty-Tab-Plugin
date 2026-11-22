@@ -2,9 +2,20 @@
 
 All changes made to Nighty Tab Plugin and related Equicord integration files.
 
+## Equicord CSP build
+
+- **Removed exports**: Current Equicord no longer exports `CSPSrc`, `addResponseHeaderHook`, or `addBeforeSendHeadersHook`, so `native.ts` failed to compile. The plugin keeps the old directive list locally, including `frame-src`, and registers its own header and cookie listeners before Equicord locks `onHeadersReceived`.
+- **Embedded pages**: Discord's `frame-src` list is fixed when the Discord window loads. The saved Nighty URL is added to that list before the document is served. Changing the URL reloads Discord once so the new address can load in the tab.
+- **Localhost**: Discord only allows `https://localhost:*`. The plugin also allows `http://localhost:*` and `http://127.0.0.1:*`, so any local port can load in the tab.
+- **Icons**: Replaced the 24×16 PNGs with the 145×145 WebP marks. The sidebar draws them at 20px and the server list at 24px with `object-fit: contain`, so the larger source stays sharp and does not need to be shrunk first.
+- **HTTP addresses**: An https Discord page blocks a public `http://ip:port` frame, or upgrades it to `https://ip:port` and the frame hangs. Any remote http address is opened through `http://127.0.0.1`, which Discord already treats like localhost. A different host or port does not need its own exception.
+
 ## Login refresh
 
-- **Cookie scheme**: Login pages set an `access_token` cookie and then reload. The embed was rewriting every cookie to `Secure; SameSite=None; Partitioned`. That attribute set is rejected on `http://ip:port`, and a partitioned cookie is not the one the iframe sends on reload, so the reload returned to the login screen. `https` embeds now get `Secure; SameSite=None` only. `http` embeds keep the cookie the page set.
+- **Cookie scheme**: Login pages set an `access_token` cookie and then reload. The embed was rewriting every cookie to `Secure; SameSite=None; Partitioned`. That attribute set is rejected on `http://ip:port`, and a partitioned cookie created from the main process is not tied to Discord, so the reload returned to the login screen. `http` embeds keep the cookie the page set. `https` responses are partitioned from the iframe itself.
+- **Login reload**: The dashboard reloads as soon as `/api/login` returns, before the frame script can store the token. The main process now reads that response first and sends `access_token` on the next request, including `http` pages that cannot keep a third-party cookie.
+- **Login page check**: That reload still opened the sign-in screen because the dashboard reads `document.cookie` in the page, and Chromium does not keep the third-party cookie. The embedded document now gets the saved token before its own scripts run, and the cookie listener can no longer be replaced.
+- **Session cookie**: `https://nighty.mime.at` logs in with an HttpOnly `session` cookie and renders the dashboard on the next document. The embed now keeps every `Set-Cookie` from that host and sends those cookies on the following request. The iframe is allowed to reload into that dashboard. Discord itself is not reloaded. The document body is no longer rewritten, so a compressed dashboard cannot be corrupted on the way through.
 
 ## Render error fixes
 
