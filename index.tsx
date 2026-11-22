@@ -7,8 +7,9 @@
 import "./style.css";
 
 import { findGroupChildrenByChildId, NavContextMenuPatchCallback } from "@api/ContextMenu";
-import { addServerListElement, removeServerListElement, ServerListRenderPosition } from "@api/ServerList";
+import { addServerListElement, removeServerListElement, ServerListItem, ServerListRenderPosition } from "@api/ServerList";
 import { definePluginSettings, migratePluginSettings } from "@api/Settings";
+import { Button } from "@components/Button";
 import ErrorBoundary from "@components/ErrorBoundary";
 import { classNameFactory } from "@utils/css";
 import { sendMessage } from "@utils/discord";
@@ -16,7 +17,9 @@ import { classes } from "@utils/misc";
 import definePlugin, { OptionType, PluginNative } from "@utils/types";
 import { Message } from "@vencord/discord-types";
 import { findByCodeLazy, findComponentByCodeLazy } from "@webpack";
-import { ChannelStore, Menu, MessageActions, NavigationRouter, SelectedChannelStore, useEffect, useState, useStateFromStores } from "@webpack/common";
+import { ChannelStore, Menu, MessageActions, NavigationRouter, useEffect, useRef, useState } from "@webpack/common";
+import blueIconBase64 from "file://./asset/icon.webp?base64";
+import grayscaleIconBase64 from "file://./asset/icon-grayscale.webp?base64";
 import type { MouseEvent, ReactElement } from "react";
 
 const Native = IS_DISCORD_DESKTOP
@@ -25,9 +28,28 @@ const Native = IS_DISCORD_DESKTOP
 
 const NIGHTY_ROUTE = "/nighty";
 const NIGHTY_ITEM_ID = "nighty";
+const SLOW_LOAD_TIMEOUT_MS = 10_000;
 const cl = classNameFactory("vc-nighty-tab-");
-const SETTINGS_KEYS = ["url"] as const;
-const ICON_SETTINGS_KEYS = ["iconType", "customIconUrl"] as const;
+const URL_SETTINGS_KEYS = ["url"] as ("url")[];
+const ICON_SETTINGS_KEYS = ["iconType", "customIconUrl"] as ("iconType" | "customIconUrl")[];
+const TAB_PLACEMENT_KEYS = ["tabPlacement"] as ("tabPlacement")[];
+
+const BLUE_ICON = `data:image/webp;base64,${blueIconBase64}`;
+const GRAYSCALE_ICON = `data:image/webp;base64,${grayscaleIconBase64}`;
+
+migratePluginSettings("Nighty Tab", "ExtraHomeTab");
+
+function pageUrl(value: string | undefined): string | null {
+    const trimmed = (value ?? "").trim();
+    if (trimmed === "") return null;
+    try {
+        const url = new URL(trimmed);
+        if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+        return url.href;
+    } catch {
+        return null;
+    }
+}
 
 const settings = definePluginSettings({
     url: {
@@ -38,11 +60,12 @@ const settings = definePluginSettings({
         isValid(value: string) {
             const trimmed = value.trim();
             if (trimmed === "") return true;
-            try {
-                const url = new URL(trimmed);
-                if (url.protocol === "https:" || url.protocol === "http:") return true;
-            } catch { /* invalid URL */ }
-            return "Use an http or https URL";
+            if (pageUrl(trimmed) !== null) return true;
+            return "Use an http or https URL.";
+        },
+        onChange(newValue: string) {
+            const valid = pageUrl(newValue);
+            if (Native && valid !== null) void Native.allowEmbed(valid);
         }
     },
     tabPlacement: {
@@ -77,12 +100,13 @@ const settings = definePluginSettings({
         isValid(value: string) {
             if (this.store.iconType !== "custom") return true;
             const trimmed = value.trim();
-            if (trimmed === "") return "Enter a valid image URL";
-            try {
-                const url = new URL(trimmed);
-                if (url.protocol === "https:" || url.protocol === "http:") return true;
-            } catch { /* invalid */ }
-            return "Use an http or https image URL";
+            if (trimmed === "") return "Enter a valid image URL.";
+            if (pageUrl(trimmed) !== null) return true;
+            return "Use an http or https image URL.";
+        },
+        onChange(newValue: string) {
+            const valid = pageUrl(newValue);
+            if (Native && valid !== null) void Native.allowIcon(valid);
         }
     },
     scriptUtils: {
@@ -103,38 +127,51 @@ const settings = definePluginSettings({
         },
         isValid(value: string) {
             if (!this.store.scriptUtils) return true;
-            if (value.length === 1) return true;
-            return "Use one character.";
+            if (value.trim().length === 1) return true;
+            return "Use one non-whitespace character.";
         }
     }
 });
 
-migratePluginSettings("Nighty Tab", "ExtraHomeTab");
+const routeListeners = new Set<() => void>();
+let onNightyRoute = false;
 
-function pageUrl(value: string | undefined): string | null {
-    const trimmed = (value ?? "").trim();
-    if (trimmed === "") return null;
-    try {
-        const url = new URL(trimmed);
-        if (url.protocol !== "http:" && url.protocol !== "https:") return null;
-        return url.href;
-    } catch {
-        return null;
-    }
+function setNightyRouteActive(active: boolean) {
+    if (onNightyRoute === active) return;
+    onNightyRoute = active;
+    for (const listener of routeListeners) listener();
 }
-import blueIconBase64 from "file://./asset/icon.webp?base64";
-import grayscaleIconBase64 from "file://./asset/icon-grayscale.webp?base64";
 
-const BLUE_ICON = `data:image/webp;base64,${blueIconBase64}`;
-const GRAYSCALE_ICON = `data:image/webp;base64,${grayscaleIconBase64}`;
+function useIsNightySelected(): boolean {
+    const [selected, setSelected] = useState(onNightyRoute);
+
+    useEffect(() => {
+        const update = () => setSelected(onNightyRoute);
+        routeListeners.add(update);
+        update();
+        return () => {
+            routeListeners.delete(update);
+        };
+    }, []);
+
+    return selected;
+}
 
 function getNightyIcon(iconType: string | undefined, customUrl: string | undefined): string {
     if (iconType === "grayscale") return GRAYSCALE_ICON;
     if (iconType === "custom") {
-        const trimmed = (customUrl ?? "").trim();
-        if (trimmed !== "") return trimmed;
+        const valid = pageUrl(customUrl);
+        if (valid !== null) return valid;
     }
     return BLUE_ICON;
+}
+
+function openInBrowser(url: string) {
+    if (IS_DISCORD_DESKTOP) {
+        void VencordNative.native.openExternal(url);
+    } else {
+        window.open(url, "_blank", "noopener,noreferrer");
+    }
 }
 
 interface LinkIconProps {
@@ -174,15 +211,27 @@ const usePrivateChannelListItem: (id: string) => PrivateChannelListItem = findBy
     "useState(-1)"
 );
 
-function NightyIcon({ className }: LinkIconProps) {
+function useResolvedIconSrc(): string {
     const { iconType, customIconUrl } = settings.use(ICON_SETTINGS_KEYS);
-    const iconSrc = getNightyIcon(iconType, customIconUrl);
+    const configuredSrc = getNightyIcon(iconType, customIconUrl);
 
     useEffect(() => {
-        if (Native && iconType === "custom" && customIconUrl) {
-            void Native.allowEmbed(customIconUrl);
+        if (Native && iconType === "custom") {
+            const valid = pageUrl(customIconUrl);
+            if (valid !== null) void Native.allowIcon(valid);
         }
     }, [iconType, customIconUrl]);
+
+    return configuredSrc;
+}
+
+function NightyIcon({ className }: LinkIconProps) {
+    const configuredSrc = useResolvedIconSrc();
+    const [failed, setFailed] = useState(false);
+
+    useEffect(() => {
+        setFailed(false);
+    }, [configuredSrc]);
 
     return (
         <img
@@ -191,15 +240,39 @@ function NightyIcon({ className }: LinkIconProps) {
             className={classes(className, cl("icon"))}
             draggable={false}
             height={20}
-            src={iconSrc}
+            onError={() => setFailed(true)}
+            src={failed ? BLUE_ICON : configuredSrc}
             width={20}
         />
     );
 }
 
+function NightyServerListIcon() {
+    const configuredSrc = useResolvedIconSrc();
+    const [failed, setFailed] = useState(false);
+
+    useEffect(() => {
+        setFailed(false);
+    }, [configuredSrc]);
+
+    return (
+        <div className={cl("guild-icon-container")}>
+            <img
+                alt=""
+                aria-hidden="true"
+                className={cl("guild-icon")}
+                draggable={false}
+                height={24}
+                onError={() => setFailed(true)}
+                src={failed ? BLUE_ICON : configuredSrc}
+                width={24}
+            />
+        </div>
+    );
+}
+
 function NightyMenuIcon({ className, height = 20, width = 20 }: { className?: string; height?: number | string; width?: number | string; }) {
-    const { iconType, customIconUrl } = settings.use(ICON_SETTINGS_KEYS);
-    const iconSrc = getNightyIcon(iconType, customIconUrl);
+    const iconSrc = useResolvedIconSrc();
 
     return (
         <svg aria-hidden="true" className={className} height={height} viewBox="0 0 24 24" width={width}>
@@ -211,17 +284,18 @@ function NightyMenuIcon({ className, height = 20, width = 20 }: { className?: st
 function sendDownloadScript(message: Message) {
     const channel = ChannelStore.getChannel(message.channel_id);
     if (!channel) return;
+    const prefix = settings.plain.nightyPrefix.trim().slice(0, 1) || ".";
     const options = MessageActions.getSendMessageOptionsForReply({
         channel,
         message,
         shouldMention: false,
         showMentionToggle: false
     });
-    void sendMessage(channel.id, { content: `${settings.store.nightyPrefix.slice(0, 1)}dls` }, true, options);
+    void sendMessage(channel.id, { content: `${prefix}dls` }, true, options);
 }
 
 const messageContextMenuPatch: NavContextMenuPatchCallback = (children, { message }: { message?: Message; }) => {
-    if (!settings.store.scriptUtils || !message || message.attachments.length === 0) return;
+    if (!settings.plain.scriptUtils || !message || message.attachments.length === 0) return;
 
     const group = findGroupChildrenByChildId("copy-text", children);
     const item = (
@@ -242,46 +316,91 @@ const messageContextMenuPatch: NavContextMenuPatchCallback = (children, { messag
     }
 };
 
+type EmbedState = "checking" | "ready" | "needsReload";
+
 const NightyPage = ErrorBoundary.wrap(function NightyPage() {
-    const { url } = settings.use(SETTINGS_KEYS);
+    const { url } = settings.use(URL_SETTINGS_KEYS);
     const configured = pageUrl(url);
+    const configuredOrigin = configured !== null ? new URL(configured).origin : null;
+    const iframeRef = useRef<HTMLIFrameElement>(null);
+
     const [src, setSrc] = useState<string | null>(configured);
+    const [embedState, setEmbedState] = useState<EmbedState>(Native && configured !== null ? "checking" : "ready");
     const [loaded, setLoaded] = useState(false);
+    const [slowLoad, setSlowLoad] = useState(false);
+    const [loadError, setLoadError] = useState(false);
+    const [reloadKey, setReloadKey] = useState(0);
+
+    const frameOrigin = src !== null ? new URL(src).origin : null;
 
     useEffect(() => {
-        if (configured === null) {
-            setSrc(null);
-            return;
-        }
-        let cancel = false;
-        const next = Native ? Native.localEmbedUrl(configured) : Promise.resolve(configured);
-        void Promise.resolve(next).then(value => {
-            if (!cancel) setSrc(value || configured);
-        });
-        return () => {
-            cancel = true;
-        };
-    }, [configured]);
+        setNightyRouteActive(true);
+        return () => setNightyRouteActive(false);
+    }, []);
 
     useEffect(() => {
         setLoaded(false);
-    }, [src]);
+        setSlowLoad(false);
+        setLoadError(false);
 
-    useEffect(() => {
-        if (Native && configured !== null) void Native.allowEmbed(configured);
+        if (configured === null) {
+            setSrc(null);
+            setEmbedState("ready");
+            return;
+        }
+
+        if (!Native) {
+            setSrc(configured);
+            setEmbedState("ready");
+            return;
+        }
+
+        let cancelled = false;
+        setEmbedState("checking");
+        void Promise.all([
+            Native.allowEmbed(configured),
+            Native.localEmbedUrl(configured)
+        ]).then(([allowRes, resolvedUrl]) => {
+            if (cancelled) return;
+            setSrc(resolvedUrl || configured);
+            setEmbedState(allowRes.needsReload ? "needsReload" : "ready");
+        }).catch(() => {
+            if (cancelled) return;
+            setSrc(configured);
+            setEmbedState("ready");
+        });
+
+        return () => {
+            cancelled = true;
+        };
     }, [configured]);
 
     useEffect(() => {
+        if (embedState !== "ready" || loaded || loadError || src === null) return;
+        const timer = setTimeout(() => setSlowLoad(true), SLOW_LOAD_TIMEOUT_MS);
+        return () => clearTimeout(timer);
+    }, [embedState, loaded, loadError, src, reloadKey]);
+
+    useEffect(() => {
+        if (!Native || frameOrigin === null || configuredOrigin === null) return;
+
         const handleMessage = (e: MessageEvent) => {
-            if (e.data?.type === "VC_NIGHTY_TOKEN" && typeof e.data.token === "string" && typeof e.data.host === "string") {
-                if (Native) void Native.saveToken(e.data.host, e.data.token, e.data.protocol);
+            if (e.source !== iframeRef.current?.contentWindow) return;
+            if (e.origin !== frameOrigin) return;
+            if (
+                e.data?.type === "VC_NIGHTY_TOKEN"
+                && typeof e.data.token === "string"
+                && e.data.origin === frameOrigin
+            ) {
+                void Native.saveToken(configuredOrigin, e.data.token);
             }
         };
+
         window.addEventListener("message", handleMessage);
         return () => window.removeEventListener("message", handleMessage);
-    }, []);
+    }, [frameOrigin, configuredOrigin]);
 
-    if (src === null) {
+    if (configured === null) {
         return (
             <div className={cl("page")}>
                 <div className={cl("empty")}>
@@ -292,107 +411,120 @@ const NightyPage = ErrorBoundary.wrap(function NightyPage() {
         );
     }
 
+    if (embedState === "needsReload") {
+        return (
+            <div className={cl("page")}>
+                <div className={cl("empty")}>
+                    <h2>Reload required</h2>
+                    <p>Discord needs to reload once so its security policy allows embedding {configuredOrigin}.</p>
+                    <div className={cl("actions")}>
+                        <Button size="small" onClick={() => location.reload()}>
+                            Reload Discord
+                        </Button>
+                        <Button size="small" variant="secondary" onClick={() => openInBrowser(configured)}>
+                            Open in Browser
+                        </Button>
+                    </div>
+                </div>
+            </div>
+        );
+    }
+
+    if (loadError) {
+        return (
+            <div className={cl("page")}>
+                <div className={cl("empty")}>
+                    <h2>Failed to load page</h2>
+                    <p>Could not load {configuredOrigin} inside Discord.</p>
+                    <div className={cl("actions")}>
+                        <Button
+                            size="small"
+                            onClick={() => {
+                                setLoadError(false);
+                                setLoaded(false);
+                                setSlowLoad(false);
+                                setReloadKey(k => k + 1);
+                            }}
+                        >
+                            Retry
+                        </Button>
+                        <Button size="small" variant="secondary" onClick={() => openInBrowser(configured)}>
+                            Open in Browser
+                        </Button>
+                    </div>
+                </div>
+            </div>
+        );
+    }
+
     return (
         <div className={cl("page")}>
-            {!loaded && (
+            {(embedState === "checking" || !loaded) && (
                 <div className={cl("loader")}>
                     <div className={cl("spinner")} />
                     <span className={cl("loader-text")}>Loading Nighty...</span>
+                    {slowLoad && (
+                        <div className={cl("actions")}>
+                            <Button
+                                size="small"
+                                variant="secondary"
+                                onClick={() => {
+                                    setSlowLoad(false);
+                                    setReloadKey(k => k + 1);
+                                }}
+                            >
+                                Reload Tab
+                            </Button>
+                            <Button size="small" variant="secondary" onClick={() => openInBrowser(configured)}>
+                                Open in Browser
+                            </Button>
+                        </div>
+                    )}
                 </div>
             )}
-            <iframe
-                className={classes(cl("frame"), !loaded && cl("frame-hidden"))}
-                onLoad={() => setLoaded(true)}
-                src={src}
-                title="Nighty"
-            />
+            {embedState === "ready" && src !== null && (
+                <iframe
+                    key={reloadKey}
+                    ref={iframeRef}
+                    className={classes(cl("frame"), !loaded && cl("frame-hidden"))}
+                    onError={() => setLoadError(true)}
+                    onLoad={() => {
+                        setLoaded(true);
+                        setSlowLoad(false);
+                    }}
+                    src={src}
+                    title="Nighty"
+                />
+            )}
         </div>
     );
 }, { noop: true });
 
-const GuildlessServerListItemComponent = findComponentByCodeLazy("tooltip:", "lowerBadgeSize:");
-const ServerListItemPillComponent = findComponentByCodeLazy("=!1,hovered:", "=!1,unread:", "=!1,disabled:");
-
-function NightyServerListIcon() {
-    const { iconType, customIconUrl } = settings.use(ICON_SETTINGS_KEYS);
-    const iconSrc = getNightyIcon(iconType, customIconUrl);
-
-    useEffect(() => {
-        if (Native && iconType === "custom" && customIconUrl) {
-            void Native.allowEmbed(customIconUrl);
-        }
-    }, [iconType, customIconUrl]);
-
-    return (
-        <img
-            alt=""
-            aria-hidden="true"
-            className={cl("guild-icon")}
-            draggable={false}
-            height={24}
-            src={iconSrc}
-            width={24}
-        />
-    );
-}
-
 const NightyGuildButton = ErrorBoundary.wrap(function NightyGuildButton() {
-    const { tabPlacement } = settings.use(["tabPlacement"]);
-    const isSelected = useStateFromStores(
-        [SelectedChannelStore],
-        () => window.location.pathname.startsWith(NIGHTY_ROUTE)
-    );
-    const [hovered, setHovered] = useState(false);
+    const { tabPlacement } = settings.use(TAB_PLACEMENT_KEYS);
+    const isSelected = useIsNightySelected();
 
     if (tabPlacement === "sidebar") return null;
 
-    const icon = (
-        <div className={cl("guild-icon-container")}>
-            <NightyServerListIcon />
-        </div>
-    );
-
     return (
-        <div className={cl("guild-item-container")}>
-            <div className={cl("guild-item-pill")}>
-                <ServerListItemPillComponent
-                    unread={false}
-                    selected={isSelected}
-                    hovered={hovered}
-                    className={classes(
-                        cl("guild-pill"),
-                        isSelected && "selected",
-                        hovered && "hovered"
-                    )}
-                />
-            </div>
-            <div className={cl("guild-button-container")}>
-                <GuildlessServerListItemComponent
-                    icon={() => icon}
-                    tooltip="Nighty"
-                    showPill={false}
-                    selected={isSelected}
-                    className={cl("guild-button")}
-                    onClick={(e: MouseEvent<Element>) => {
-                        e.preventDefault();
-                        e.stopPropagation();
-                        NavigationRouter.transitionTo(NIGHTY_ROUTE);
-                    }}
-                    onMouseEnter={() => setHovered(true)}
-                    onMouseLeave={() => setHovered(false)}
-                />
-            </div>
-        </div>
+        <ServerListItem
+            id="vc-nighty-guild-button"
+            icon={NightyServerListIcon}
+            tooltip="Nighty"
+            selected={isSelected}
+            onClick={(e: MouseEvent<Element>) => {
+                e.preventDefault();
+                e.stopPropagation();
+                NavigationRouter.transitionTo(NIGHTY_ROUTE);
+            }}
+        />
     );
 }, { noop: true });
 
 const NightyTab = ErrorBoundary.wrap(function NightyTab() {
-    const { tabPlacement } = settings.use(["tabPlacement"]);
+    const { tabPlacement } = settings.use(TAB_PLACEMENT_KEYS);
     const listItem = usePrivateChannelListItem(NIGHTY_ITEM_ID);
-    const isSelected = useStateFromStores(
-        [SelectedChannelStore],
-        () => window.location.pathname.startsWith(NIGHTY_ROUTE)
-    );
+    const isSelected = useIsNightySelected();
 
     if (tabPlacement === "guilds") return null;
 
@@ -430,7 +562,7 @@ export default definePlugin({
     messagePopoverButton: {
         icon: NightyMenuIcon,
         render(message) {
-            if (!settings.store.scriptUtils || message.attachments.length === 0) return null;
+            if (!settings.plain.scriptUtils || message.attachments.length === 0) return null;
             const channel = ChannelStore.getChannel(message.channel_id);
             if (!channel) return null;
             return {
@@ -443,13 +575,14 @@ export default definePlugin({
         }
     },
 
-    renderGuildButton: ErrorBoundary.wrap(NightyGuildButton, { noop: true }),
+    renderGuildButton: NightyGuildButton,
 
     start() {
-        const src = pageUrl(settings.store.url);
+        const src = pageUrl(settings.plain.url);
         if (Native && src !== null) void Native.allowEmbed(src);
-        if (Native && settings.store.iconType === "custom" && settings.store.customIconUrl) {
-            void Native.allowEmbed(settings.store.customIconUrl);
+        if (Native && settings.plain.iconType === "custom") {
+            const iconSrc = pageUrl(settings.plain.customIconUrl);
+            if (iconSrc !== null) void Native.allowIcon(iconSrc);
         }
         addServerListElement(ServerListRenderPosition.Above, this.renderGuildButton);
     },
@@ -459,15 +592,6 @@ export default definePlugin({
     },
 
     patches: [
-        {
-            // Discord keeps the guild-bar button local to the server list module.
-            // Export it so the server-list Nighty button can render that same control.
-            find: '="DOWNLOAD_APPS"',
-            replacement: {
-                match: /n\.d\(t,\{A:\(\)=>(\i)\}\)(?=[\s\S]{0,40000}?let (\i)=function\(\i\)\{let\{ref:\i,\.\.\.\i\}=\i,\{id:\i,onClick:\i,onContextMenu:\i,icon:\i,selected:\i,tooltip:)/,
-                replace: "n.d(t,{A:()=>$1,GuildlessServerListItemComponent:()=>$2})"
-            }
-        },
         {
             find: '"section-divider-top"',
             replacement: {
