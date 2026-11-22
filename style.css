@@ -75,39 +75,10 @@
     padding: 16px;
 }
 
-/* Server list button & indicator pill */
-.vc-nighty-tab-guild-item-container {
-    position: relative;
-    width: 100%;
+.vc-nighty-tab-actions {
     display: flex;
-    justify-content: center;
-}
-
-.vc-nighty-tab-guild-item-pill {
-    position: absolute;
-    top: 0;
-    left: 0;
-    height: 100%;
-    pointer-events: none;
-}
-
-.vc-nighty-tab-guild-item-pill > [class*="item"] {
-    will-change: transform;
-    max-height: 8px;
-    min-height: 8px;
-    transition: max-height 0.2s ease-in-out;
-}
-
-.vc-nighty-tab-guild-item-pill.hovered > [class*="item"] {
-    max-height: 20px;
-}
-
-.vc-nighty-tab-guild-item-pill.selected > [class*="item"] {
-    max-height: 40px;
-}
-
-.vc-nighty-tab-guild-button-container {
-    position: relative;
+    gap: 8px;
+    margin-top: 8px;
 }
 
 .vc-nighty-tab-guild-icon-container {
@@ -125,4 +96,3 @@
     object-fit: contain;
     border-radius: 4px;
 }
-
